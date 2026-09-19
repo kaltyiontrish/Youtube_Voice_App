@@ -1,0 +1,79 @@
+# voiceyt configuration (plan2.md §10)
+#
+# Every timing value, path and model id lives here - no magic numbers in code.
+# Command words are matched *after* normalization: lower-cased, accents
+# stripped, punctuation removed, whitespace collapsed.  Write verbs without
+# accents.
+
+audio:
+  device: null            # null = system default; --list-devices prints indices
+  sample_rate: 16000      # Hz. The VAD and every ASR backend assume 16 kHz mono.
+
+aec:
+  enabled: false          # start false, see plan2.md §8
+  backend: echoff         # echoff | voiceclean | speexdsp
+  loopback_device: null   # WASAPI loopback index used as the playback reference
+  frame_ms: 10            # AEC frame size: WebRTC APM and Speex both want 10 ms
+  stream_delay_ms: 0      # extra alignment offset applied to the reference
+
+asr:
+  backend: parakeet       # whisper | parakeet | nemotron (set from --bench results)
+  models_dir: ./models
+  device: cuda            # cuda | cpu
+  language: pt            # forced for whisper: auto-detect drifts to Spanish
+  whisper:
+    model: small          # any faster-whisper size or a local directory name
+    compute_type: float16
+    beam_size: 1          # greedy keeps latency down (faster-whisper default: 5)
+    condition_on_previous_text: false
+  parakeet:
+    model_id: nemo-parakeet-tdt-0.6b-v3   # onnx-asr id for nvidia/parakeet-tdt-0.6b-v3
+    quantization: null                    # null | int8
+  nemotron:
+    model_id: codavidgarcia/nemotron-3.5-asr-streaming-0.6b-onnx
+    chunk_ms: 320         # 80/160/320/560/1120 supported by the export tooling
+    precision: fp16       # fp16 | fp32 | int8
+    language: auto        # auto emits <xx-XX> tags; pt-PT is also available
+
+vad:
+  enabled: true
+  model_path: ./models/vad/silero_vad.onnx
+  threshold: 0.5
+  min_speech_ms: 150      # ignore shorter blips
+  min_silence_ms: 400     # silence that closes an utterance
+  max_utterance_s: 25     # hard cap, keeps batch backends inside their window
+
+trigger:
+  words: [youtube, "you tube", iutube, "u tube", utube]
+  trigger_window_ms: 1500   # how long a verb is still accepted after the trigger
+  silence_end_ms: 800       # silence that ends a query early
+  query_max_ms: 6000        # hard cap on collecting a query
+
+player:
+  mpv_path: mpv
+  ipc_path: null          # null = auto per OS: \\.\pipe\voiceyt | /tmp/voiceyt.sock
+  audio_only: true
+  volume_step: 10
+  volume_min: 0
+  volume_max: 130
+  start_timeout_s: 10
+  extra_args: ["--no-video", "--really-quiet", "--idle=yes"]
+
+search:
+  results: 5              # size of the "proximo" pool
+  cookies_from_browser: null   # e.g. firefox, if bot checks start
+  socket_timeout_s: 15
+
+behaviour:
+  log_transcripts: true
+  log_path: ./logs/transcripts.log
+  log_level: INFO
+  ignore_trigger_ms_after_play: 500
+  require_same_utterance_while_playing: true   # plan2.md §8 step 3
+
+commands:
+  - {action: play,        verbs: [passa, toca, poe, mete],             takes_query: true}
+  - {action: next,        verbs: [proximo, seguinte, outra, salta],    takes_query: false}
+  - {action: stop,        verbs: [para, pausa, chega],                 takes_query: false}
+  - {action: volume_up,   verbs: ["mais alto", aumenta, "sobe o som"], takes_query: false}
+  - {action: volume_down, verbs: ["mais baixo", baixa, "baixa o som"], takes_query: false}

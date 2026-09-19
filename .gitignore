@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Models and runtime artefacts (large, re-downloadable)
+models/
+logs/
+captures/
+
+# Audio fixtures recorded during testing
+*.wav
+*.flac
+
+# Local overrides
+config.local.yaml

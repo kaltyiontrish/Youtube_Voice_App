@@ -1,0 +1,31 @@
+# voiceyt — pinned runtime dependencies (Python 3.11)
+#
+# GPU notes for this machine (RTX 2060 6GB, driver 546.33 => CUDA 12.3):
+#   * onnxruntime-gpu must stay < 1.27, because 1.27+ requires CUDA 13.
+#   * Install with the CUDA/cuDNN wheels so no system-wide CUDA toolkit is needed:
+#       pip install "onnxruntime-gpu[cuda,cudnn]<1.27"
+#   * CTranslate2 (faster-whisper) needs cuBLAS 12 + cuDNN 9 for CUDA 12;
+#     the nvidia-cublas-cu12 / nvidia-cudnn-cu12 wheels above satisfy both.
+#   * voiceyt.dlls adds the nvidia/*/bin directories to PATH at startup.
+
+# --- core ---
+numpy>=1.26,<3
+pyyaml>=6.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+huggingface_hub>=0.30.2
+scipy>=1.10              # resampling for --bench on non-16 kHz files
+
+# --- search / playback ---
+yt-dlp>=2024.8.6
+
+# --- ASR backends ---
+faster-whisper>=1.0.3          # backend: whisper (CTranslate2)
+onnx-asr>=0.10                 # backend: parakeet (parakeet-tdt-0.6b-v3)
+onnxruntime-gpu<1.27           # CUDAExecutionProvider, also used by the VAD + nemotron
+# faster-whisper's ffmpeg is bundled through PyAV, no system ffmpeg needed for decoding.
+
+# --- optional: echo cancellation (plan §8 step 2, only if needed) ---
+# echoff>=0.2.0                # Windows WASAPI loopback + WebRTC AEC, pulls PyAudioWPatch
+# voiceclean>=0.3.6            # pure numpy AEC/VAD, no C libraries
+# speexdsp>=0.1.1              # stable Speex AEC; requires libspeexdsp + your own reference

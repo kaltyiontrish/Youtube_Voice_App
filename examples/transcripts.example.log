@@ -1,0 +1,23 @@
+2026-09-19T18:00:00.000	whisper	final	vi um video no youtube ontem sobre aquele assunto
+2026-09-19T18:00:06.500	whisper	final	o youtube tem coisas boas e coisas mas
+2026-09-19T18:00:12.100	whisper	final	para mim esta bem assim
+2026-09-19T18:00:18.900	whisper	final	isso esta mais alto do que devia
+2026-09-19T18:00:25.300	whisper	final	proximo domingo vou a lisboa
+2026-09-19T18:00:31.700	whisper	final	pausa para pensar um bocado
+2026-09-19T18:00:38.200	whisper	final	aumenta a luz da sala
+2026-09-19T18:00:44.900	whisper	final	baixa o preco do produto
+2026-09-19T18:00:51.400	whisper	final	os youtubers falam muito depressa
+2026-09-19T18:01:00.000	whisper	final	youtube passa nirvana smells like teen spirit
+2026-09-19T18:01:01.200	-	command	action=play query=nirvana smells like teen spirit reason=query completed in one utterance
+2026-09-19T18:03:30.500	whisper	final	esta musica e boa
+2026-09-19T18:04:02.800	whisper	final	youtube mais alto
+2026-09-19T18:04:03.100	-	command	action=volume_up query= reason=verb without query
+2026-09-19T18:04:20.000	whisper	final	youtube proximo
+2026-09-19T18:04:20.400	-	command	action=next query= reason=verb without query
+2026-09-19T18:05:10.000	whisper	final	youtube para
+2026-09-19T18:05:10.300	-	command	action=stop query= reason=verb without query
+2026-09-19T18:05:40.000	whisper	final	youtube
+2026-09-19T18:05:40.600	whisper	final	passa radiohead creep
+2026-09-19T18:05:41.000	-	command	action=play query=radiohead creep reason=query completed in one utterance
+2026-09-19T18:07:00.000	whisper	final	youtube para
+2026-09-19T18:07:00.300	-	command	action=stop query= reason=verb without query

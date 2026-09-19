@@ -1,0 +1,14 @@
+# Keep the vendored third-party file byte-identical to upstream: converting its
+# line endings to CRLF would break the checksum comparison against the source repo.
+voiceyt/vendor/nemotron_onnx_streaming.py text eol=lf
+voiceyt/vendor/LICENSE-nemotron-onnx-engine text eol=lf
+
+# Journals and recordings are produced on Windows but read anywhere.
+*.log text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+# Binary artefacts that must never be normalised.
+*.onnx binary
+*.wav binary
+*.flac binary

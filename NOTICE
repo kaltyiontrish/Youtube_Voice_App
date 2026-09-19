@@ -1,0 +1,42 @@
+voiceyt - third-party components and licences
+=============================================
+
+This file records the licences of everything voiceyt bundles or downloads, so the
+obligations of each are clear.
+
+1. Vendored code: voiceyt/vendor/nemotron_onnx_streaming.py
+-----------------------------------------------------------
+   Upstream : https://github.com/codavidgarcia/nemotron-3.5-asr-streaming-onnx
+              (engine/nemotron_onnx_streaming.py)
+   Licence  : Apache-2.0 (see voiceyt/vendor/LICENSE-nemotron-onnx-engine)
+   Purpose  : NumPy + onnxruntime streaming engine (cache-aware encoder, RNNT
+              greedy decode, log-mel features) for the Nemotron ONNX export.
+              Vendored byte-for-byte; only voiceyt/asr/nemotron.py imports it.
+
+2. Model weights: nvidia/nemotron-3.5-asr-streaming-0.6b (ONNX export by
+   codavidgarcia)
+-----------------------------------------------------------
+   Source   : https://huggingface.co/codavidgarcia/nemotron-3.5-asr-streaming-0.6b-onnx
+   Licence  : OpenMDW-1.1 (NVIDIA), NOT Apache/MIT. Use, modification and
+              redistribution are permitted with attribution. The repository ships
+              LICENSE-OpenMDW-1.1 and NOTICE, which are downloaded alongside the
+              weights into models/nemotron/.
+
+3. Models: NVIDIA Parakeet TDT 0.6B v3 (nvidia/parakeet-tdt-0.6b-v3)
+-----------------------------------------------------------
+   ONNX export/runner: onnx-asr (MIT), https://github.com/istupakov/onnx-asr
+   Licence of the weights: CC-BY-4.0
+
+4. Models: OpenAI Whisper (small) via faster-whisper / CTranslate2
+-----------------------------------------------------------
+   Licence  : MIT (OpenAI Whisper weights, CTranslate2, faster-whisper)
+
+5. VAD: Silero VAD (snakers4/silero-vad)
+-----------------------------------------------------------
+   Licence  : MIT. The ONNX graph (about 2 MB) is downloaded directly, so PyTorch
+              is not needed.
+
+6. mpv
+-----------------------------------------------------------
+   Licence  : GPLv2+/LGPL (mpv itself). It is an external program invoked over
+              JSON IPC; it is not linked into or redistributed with voiceyt.
