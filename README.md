@@ -93,7 +93,7 @@ in a tab-separated, greppable format:
 | Milestone | What to run | What proves it passed |
 |---|---|---|
 | M1 skeleton | `python -m voiceyt --list-devices`, then `--meter` | devices listed with indices; the level bar reacts to speech and drops in silence |
-| M2 backends | `--download-models all`, then `--bench-live 60` while reading a fixed Portuguese script | three transcripts side by side with load time, wall time and RTF; you judge which hears `youtube`/`próximo`/`pára` |
+| M2 backends | `--download-models all`, then `--bench-live 60` while reading [`examples/bench-pt.txt`](examples/bench-pt.txt) aloud | three transcripts side by side with load time, wall time and RTF; you judge which hears `youtube`/`próximo`/`pára` |
 | M2 journal | `--listen` for a few hours of ordinary talking | `logs/transcripts.log` becomes the M3 test set |
 | M3 matcher | `--replay-log logs/transcripts.log` | **zero** commands fire on real conversation; deliberate phrases all fire |
 | M4 player | `python -m voiceyt` (headphones on), speak all six commands | play/next/stop/volume all work end to end |

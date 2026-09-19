@@ -1,0 +1,37 @@
+SCRIPT DE TESTE PARA O M2 — leia em voz alta, tom normal, ~60 segundos
+(gerado para voiceyt / plan2.md; contém os alvos e também falsos positivos)
+
+--- começa aqui ---
+
+Vi um vídeo no YouTube ontem sobre aquele assunto e achei curioso.
+O YouTube tem coisas boas e coisas más, como tudo na vida.
+Amanhã vou ao YouTube ver se encontro aquela entrevista antiga.
+Ainda não decidi, para mim está bem assim, não mexo mais nisso.
+Próximo domingo vou a Lisboa e depois ao Porto, se o tempo ajudar.
+Pausa para pensar um bocado: isto está mais alto do que devia estar.
+Aumenta a luz da sala, por favor, e baixa o preço do produto que vimos.
+Os youtubers falam muito depressa e às vezes não se percebe nada.
+
+YOUTUBE PASSA NIRVANA SMELLS LIKE TEEN SPIRIT
+YOUTUBE TOCA ANA MOURA
+YOUTUBE MAIS ALTO
+YOUTUBE MAIS BAIXO
+YOUTUBE PRÓXIMO
+YOUTUBE PÁRA
+
+--- termina aqui ---
+
+
+Notas para quem estiver a ler:
+
+1. As seis frases em maiúsculas são as ordens reais. Diga-as com um ritmo
+   normal: "youtube passa nirvana..." numa só respiração.
+2. As frases em minúsculas são conversa normal e NÃO devem fazer nada.
+   Servem para medir falsos positivos.
+3. O que interessa medir em cada backend:
+      - transcreveu "youtube" corretamente? (é a palavra crítica)
+      - "próximo" apareceu como "proximo" e "pára" como "para"?
+      - "nirvana", "ana moura" saíram batidos ou deformados?
+      - quanto tempo demorou (RTF no fim da tabela)?
+4. Depois de escolher, corrija as palavras em falta também no config.yaml:
+   trigger.words (por exemplo iutube, u tube) e os verbs de cada comando.
