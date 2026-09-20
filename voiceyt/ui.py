@@ -41,6 +41,8 @@ HEARD_LIFETIME_S = 8.0   # how long the big "heard" line stays on screen
 ERROR_LIFETIME_S = 8.0   # how long an error keeps the dot red
 ACTION_LIFETIME_S = 9.0  # how long the last action label stays
 HEARD_MAX_CHARS = 110    # about two wrapped lines
+LEVEL_SPEAK = 0.02       # RMS above this = "you are speaking"
+LEVEL_FULL = 0.10        # RMS that fills the meter bar
 TITLE_MAX_CHARS = 46
 POOL_MAX_CHARS = 44
 POOL_ROWS = 5
@@ -259,6 +261,7 @@ class Overlay(tk.Tk):
         self.ui_state = state
         self.on_pool_click = on_pool_click
         self._hidden = True
+        self._meter_frac = 0.0               # smoothed mic level (0..1)
         self._build_ui()
         self.after(POLL_MS, self._poll_ui)
 
@@ -291,6 +294,14 @@ class Overlay(tk.Tk):
             wraplength=WINDOW_WIDTH - 60,
         )
         self._heard_label.pack(side="left", fill="x", expand=True)
+
+        # live microphone meter: width follows the RMS level, colour flips
+        # to "busy" while you speak (basic "is audio arriving?" feedback)
+        self._meter = tk.Canvas(self, height=4, bg=BG, highlightthickness=0)
+        self._meter.pack(fill="x", padx=14, pady=(0, 2))
+        self._meter_id = self._meter.create_rectangle(
+            0, 0, 0, 4, fill=DOT_IDLE, width=0
+        )
 
         self._action_var = tk.StringVar()
         self._action_label = tk.Label(
@@ -360,6 +371,17 @@ class Overlay(tk.Tk):
         else:
             dot = DOT_IDLE
         self._dot.itemconfig(self._dot_id, fill=dot)
+
+        # --- mic level meter ---
+        capture = self.ui_state.capture
+        level = capture.level if capture is not None else 0.0
+        frac = min(1.0, level / LEVEL_FULL)
+        self._meter_frac += 0.35 * (frac - self._meter_frac)   # smooth
+        width = int((WINDOW_WIDTH - 28) * self._meter_frac)
+        self._meter.coords(self._meter_id, 0, 0, width, 4)
+        self._meter.itemconfig(
+            self._meter_id, fill=DOT_BUSY if level > LEVEL_SPEAK else DOT_IDLE
+        )
 
         # --- big line: a fresh error outranks whatever was heard before ---
         if snap["error"] and error_age < ERROR_LIFETIME_S:
