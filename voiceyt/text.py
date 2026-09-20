@@ -20,6 +20,18 @@ import unicodedata
 _PUNCTUATION = re.compile(r"[^\w\s]+", re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
 
+# ASR models occasionally answer in Cyrillic ("Ютуб стоп").  A simple
+# Latin transliteration keeps those utterances matchable instead of lost.
+_CYRILLIC = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+_CYR_TABLE = {ord(ch): lat for ch, lat in _CYRILLIC.items()}
+_CYR_TABLE.update({ord(ch.upper()): lat for ch, lat in _CYRILLIC.items()})
+
 _phrase_cache: dict[str, tuple[str, ...]] = {}
 
 
@@ -30,10 +42,10 @@ def strip_accents(text: str) -> str:
 
 
 def normalize(text: str) -> str:
-    """Lower-case, de-accent, de-punctuate and whitespace-collapse *text*."""
+    """Lower-case, de-accent, transliterate, de-punctuate and collapse *text*."""
     if not text:
         return ""
-    lowered = strip_accents(text).lower()
+    lowered = strip_accents(text.translate(_CYR_TABLE)).lower()
     without_punct = _PUNCTUATION.sub(" ", lowered)
     return _WHITESPACE.sub(" ", without_punct).strip()
 

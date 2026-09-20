@@ -44,7 +44,7 @@ vad:
   max_utterance_s: 25     # hard cap, keeps batch backends inside their window
 
 trigger:
-  words: [youtube, "you tube", iutube, "u tube", utube]
+  words: [youtube, "you tube", iutube, "u tube", utube, yutub, yutube, "yu tube"]
   trigger_window_ms: 1500   # how long a verb is still accepted after the trigger
   silence_end_ms: 800       # silence that ends a query early
   query_max_ms: 6000        # hard cap on collecting a query
@@ -73,9 +73,10 @@ behaviour:
   ui: true                  # minimal overlay + tray icon (voiceyt.ui)
 
 commands:
-  - {action: play,        verbs: [passa, toca, poe, mete],             takes_query: true}
-  - {action: next,        verbs: [proximo, seguinte, outra, salta],    takes_query: false}
-  - {action: prev,        verbs: [anterior, volta],                   takes_query: false}
-  - {action: stop,        verbs: [para, pausa, chega],                 takes_query: false}
-  - {action: volume_up,   verbs: ["mais alto", aumenta, "sobe o som"], takes_query: false}
-  - {action: volume_down, verbs: ["mais baixo", baixa, "baixa o som"], takes_query: false}
+  # English verbs first (primary); the pt-PT spellings stay as aliases.
+  - {action: play,        verbs: [play, passa, toca, poe, mete, pley],       takes_query: true}
+  - {action: next,        verbs: [next, proximo, seguinte, outra, salta],    takes_query: false}
+  - {action: prev,        verbs: [previous, anterior, volta],                takes_query: false}
+  - {action: stop,        verbs: [stop, para, pausa, chega],                 takes_query: false}
+  - {action: volume_up,   verbs: [louder, "mais alto", aumenta, "sobe o som"], takes_query: false}
+  - {action: volume_down, verbs: [quieter, "mais baixo", baixa, "baixa o som"], takes_query: false}
