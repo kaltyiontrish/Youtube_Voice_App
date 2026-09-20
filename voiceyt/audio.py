@@ -175,6 +175,13 @@ class AudioCapture:
         self._level = 0.0
         self._dropped = 0
         self._status = ""
+        self._block_seconds = float(block_ms) / 1000.0
+        # WASAPI devices only accept their native rate (e.g. 48 kHz), so the
+        # stream may run at a different rate than the pipeline's; the callback
+        # resamples everything down to ``self.sample_rate`` before queueing.
+        self._device_rate = self.sample_rate
+        self._resamp_taps: np.ndarray | None = None
+        self._pending = np.zeros(0, dtype=np.float32)
 
     # -- state ----------------------------------------------------------- #
 
@@ -201,27 +208,78 @@ class AudioCapture:
     def open(self) -> "AudioCapture":
         self.device_index, self.device_name = resolve_device(self.device_spec)
         try:
+            self._open_stream(self.sample_rate)
+        except Exception as exc:
+            # WASAPI rejects arbitrary rates ("Invalid sample rate", PaError
+            # -9997): fall back to the device's native rate and resample.
+            message = str(exc)
+            if "ample rate" not in message and "-9997" not in message:
+                raise
+            native = int(
+                sd.query_devices(self.device_index).get("default_samplerate", 0)
+                or 48000
+            )
+            LOGGER.warning(
+                "%s rejects %d Hz; capturing at native %d Hz and resampling",
+                self.device_name,
+                self.sample_rate,
+                native,
+            )
+            self._open_stream(native)
+        self._stream.start()
+        return self
+
+    def _open_stream(self, rate: int) -> None:
+        """Open the capture at *rate* (the pipeline rate or the native one)."""
+        self._device_rate = int(rate)
+        if self._device_rate != self.sample_rate:
+            self._build_resampler(self._device_rate)
+        try:
             sd.check_input_settings(
                 device=self.device_index,
                 channels=1,
                 dtype="float32",
-                samplerate=self.sample_rate,
+                samplerate=self._device_rate,
             )
         except Exception as exc:
             raise RuntimeError(
-                f"cannot capture {self.sample_rate} Hz mono float32 from "
+                f"cannot capture {self._device_rate} Hz mono float32 from "
                 f"{self.device_name!r}: {exc}"
             ) from exc
         self._stream = sd.InputStream(
             device=self.device_index,
             channels=1,
             dtype="float32",
-            samplerate=self.sample_rate,
-            blocksize=self.block_frames,
+            samplerate=self._device_rate,
+            blocksize=max(1, int(self._device_rate * self._block_seconds)),
             callback=self._callback,
         )
-        self._stream.start()
-        return self
+
+    def _build_resampler(self, native_rate: int) -> None:
+        """Windowed-sinc anti-alias filter for *native_rate* -> pipeline rate."""
+        taps = 33
+        cutoff = 0.92 * (self.sample_rate / 2.0) / native_rate  # cycles/sample
+        n = np.arange(taps) - (taps - 1) / 2
+        h = np.sinc(2 * cutoff * n) * np.hamming(taps)
+        h /= h.sum()
+        self._resamp_taps = h.astype(np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+
+    def _downsample(self, block: np.ndarray) -> list[np.ndarray]:
+        """Resample a native-rate block and emit exact pipeline-rate chunks."""
+        if self._resamp_taps is not None:
+            block = np.convolve(block, self._resamp_taps, mode="same")
+        out_n = int(round(block.size * self.sample_rate / self._device_rate))
+        if out_n <= 0:
+            return []
+        x_out = np.linspace(0, block.size - 1, out_n)
+        resampled = np.interp(x_out, np.arange(block.size), block).astype(np.float32)
+        buf = np.concatenate([self._pending, resampled])
+        whole = (buf.size // self.block_frames) * self.block_frames
+        self._pending = buf[whole:]
+        return [
+            buf[i : i + self.block_frames] for i in range(0, whole, self.block_frames)
+        ]
 
     def close(self) -> None:
         self._closed.set()
