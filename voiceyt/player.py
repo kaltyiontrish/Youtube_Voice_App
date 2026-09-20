@@ -496,17 +496,34 @@ class MpvPlayer:
         return True
 
     def unpause(self) -> bool:
-        """Resume after pause/stop: unpause, else replay current playlist entry."""
+        """Resume after pause/stop: unpause, else replay current playlist entry.
+
+        mpv's ``stop`` clears the playlist (playlist-pos becomes -1), so a
+        plain ``set pause=no`` does nothing - in that case replay the current
+        index, which keeps the file mpv just stopped on.
+        """
         self.command("set_property", "pause", False, raise_on_error=False)
         try:
             position = self.command(
                 "get_property", "playlist-pos", timeout=2.0, raise_on_error=False
             )
+            count = self.command(
+                "get_property", "playlist-count", timeout=2.0, raise_on_error=False
+            )
         except PlayerError:
-            position = None
+            position, count = None, None
         if isinstance(position, int) and position >= 0:
             self.command("playlist-play-index", position, raise_on_error=False)
             self.command("set_property", "pause", False, raise_on_error=False)
+        elif not isinstance(count, int) or count <= 0:
+            # Playlist was cleared by stop: re-add the current file so there is
+            # something to play (mpv keeps playing the same file on "stop").
+            current = self.command(
+                "get_property", "path", timeout=2.0, raise_on_error=False
+            )
+            if current:
+                self.command("loadfile", str(current), "replace", timeout=20.0)
+                self.command("set_property", "pause", False, raise_on_error=False)
         self._playing = True
         return True
 
