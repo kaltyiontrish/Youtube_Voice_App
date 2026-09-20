@@ -83,20 +83,43 @@ class RingBuffer:
             self._filled = 0
 
 
+def _preferred_hostapis() -> set[int]:
+    """Host-API indices to list: one entry per physical device, no junk.
+
+    Windows exposes every device through 4 APIs (MME, DirectSound, WASAPI,
+    WDM-KS) so the naive list shows each microphone 3-4 times, and WDM-KS
+    adds broken entries (PC Speaker, Stereo Mix).  WASAPI is the API Windows
+    Settings itself uses; macOS equivalent is Core Audio.
+    """
+    try:
+        named = {str(api["name"]): i for i, api in enumerate(sd.query_hostapis())}
+    except Exception:  # pragma: no cover - no host API available
+        return set()
+    for api_name in ("Windows WASAPI", "Core Audio"):
+        index = named.get(api_name)
+        if index is not None:
+            return {index}
+    return set(named.values())  # linux/unknown: everything
+
+
 def list_input_devices() -> list[DeviceInfo]:
-    """Every device with at least one input channel, in PortAudio index order."""
+    """Usable input devices, in PortAudio index order (one host API only)."""
     try:
         default_input = sd.default.device[0]
     except Exception:  # pragma: no cover - no host API available
         default_input = -1
+    preferred = _preferred_hostapis()
     devices: list[DeviceInfo] = []
     for index, raw in enumerate(sd.query_devices()):
         channels = int(raw.get("max_input_channels", 0))
         if channels < 1:
             continue
+        hostapi_index = int(raw.get("hostapi", 0))
+        if preferred and hostapi_index not in preferred:
+            continue  # same device through MME/DirectSound/WDM-KS: noise
         host_api = ""
         try:
-            host_api = str(sd.query_hostapis(raw.get("hostapi", 0)).get("name", ""))
+            host_api = str(sd.query_hostapis(hostapi_index).get("name", ""))
         except Exception:  # pragma: no cover
             pass
         devices.append(
