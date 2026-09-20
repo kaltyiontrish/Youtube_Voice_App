@@ -11,6 +11,7 @@ wants), so nothing downstream has to deal with partial frames.
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
@@ -18,6 +19,8 @@ from typing import Iterator
 
 import numpy as np
 import sounddevice as sd
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -205,6 +208,34 @@ class AudioCapture:
                 stream.stop()
             finally:
                 stream.close()
+
+    def reopen(self, device: int | str | None = None) -> str:
+        """Move a live capture to *device* (used by the UI microphone picker).
+
+        Only the PortAudio stream is replaced: ``_closed`` stays clear, so the
+        consumer loop in :meth:`blocks` keeps running and the assistant simply
+        resumes on the new device.  Blocks still queued from the old device are
+        dropped and the caller's own audio pipeline must be reset separately
+        (see ``Listener.pause_event``).
+        """
+        previous = self.device_spec
+        if device is not None:
+            self.device_spec = device
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        try:
+            self.drain()
+            return self.open().device_name
+        except Exception:
+            # Best effort: get the previous device back before reporting.
+            self.device_spec = previous
+            LOGGER.error("cannot open device %r; back to %r", device, previous)
+            self.open()
+            raise
 
     def __enter__(self) -> "AudioCapture":
         return self.open()

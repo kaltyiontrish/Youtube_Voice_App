@@ -83,6 +83,7 @@ DEFAULTS: dict[str, Any] = {
         "log_level": "INFO",
         "ignore_trigger_ms_after_play": 500,
         "require_same_utterance_while_playing": True,
+        "ui": True,
     },
     "commands": [
         {"action": "play", "verbs": ["passa", "toca", "poe", "mete"], "takes_query": True},
@@ -191,6 +192,7 @@ class BehaviourConfig:
     log_level: str
     ignore_trigger_ms_after_play: int
     require_same_utterance_while_playing: bool
+    ui: bool
 
 
 @dataclass(frozen=True)
@@ -479,6 +481,11 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         ),
         require_same_utterance_while_playing=_bool(
             behaviour_raw, "require_same_utterance_while_playing", "behaviour"
+        ),
+        ui=(
+            _bool(behaviour_raw, "ui", "behaviour")
+            if "ui" in behaviour_raw
+            else True
         ),
     )
 

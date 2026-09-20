@@ -315,6 +315,10 @@ class Listener:
     ``on_silence(ts, silence_ms)`` fires for every block so the caller can run the
     matcher's timers - that is what ends a query early (``silence_end_ms``).
 
+    ``pause_event`` (optional) is checked on every block: while it is set the
+    audio is dropped instead of transcribed, so the UI can mute the assistant
+    without stopping the capture or losing the stream clock.
+
     Audio/VAD imports are deliberately local: ``--list-devices`` must not pay for
     importing onnxruntime.
     """
@@ -328,6 +332,7 @@ class Listener:
         on_partial=None,
         on_silence=None,
         canceller=None,
+        pause_event=None,
     ) -> None:
         from .audio import AudioCapture
 
@@ -337,6 +342,7 @@ class Listener:
         self.on_partial = on_partial
         self.on_silence = on_silence
         self.canceller = canceller
+        self.pause_event = pause_event
         self.capture = AudioCapture(
             device=config.audio.device, sample_rate=config.audio.sample_rate
         )
@@ -345,6 +351,7 @@ class Listener:
         self._pending: list[np.ndarray] = []
         self._pending_samples = 0
         self._stopped = False
+        self._paused_state = False
 
     @property
     def stream_ts(self) -> float:
@@ -404,6 +411,12 @@ class Listener:
 
     def process(self, block: np.ndarray) -> None:
         """Handle one captured block: AEC, VAD, then ASR."""
+        if self.pause_event is not None and self.pause_event.is_set():
+            self._drop_while_paused(block)
+            return
+        if self._paused_state:  # just resumed: start from a clean slate
+            self._paused_state = False
+            self._reset_pipeline()
         samples = self.canceller.process(block) if self.canceller is not None else block
         self._samples_seen += samples.size
         if self.segmenter is None:
@@ -463,6 +476,8 @@ class Listener:
 
     def flush(self) -> None:
         """Emit whatever is still buffered (shutdown)."""
+        if self.pause_event is not None and self.pause_event.is_set():
+            return  # nothing was transcribed while paused
         if self.segmenter is not None:
             if self.backend.streaming:
                 self._finish_stream(self.stream_ts)
@@ -476,6 +491,31 @@ class Listener:
             self._pending.clear()
             self._pending_samples = 0
             self._finish_batch(audio, self.stream_ts)
+
+    # -- pause (driven by the tray/overlay) ------------------------------- #
+
+    def _drop_while_paused(self, block: np.ndarray) -> None:
+        """Throw *block* away, keeping the stream clock in real time.
+
+        The first block of a pause also resets the pipeline so an utterance
+        can never span the pause (VAD state, AEC state, streamed hypothesis).
+        """
+        if not self._paused_state:
+            self._paused_state = True
+            self._reset_pipeline()
+        self._samples_seen += block.size
+
+    def _reset_pipeline(self) -> None:
+        self._pending.clear()
+        self._pending_samples = 0
+        if self.segmenter is not None:
+            self.segmenter.reset()
+        if self.canceller is not None:
+            self.canceller.reset()
+        # Same as _finish_batch: every backend is told to drop its buffers
+        # (a no-op for the batch ones, required for the streaming one).
+        self.backend.reset()
+
 
     # (daemon modes below)
 
@@ -541,14 +581,57 @@ def cmd_listen(config: Config) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# UI callbacks (tray thread -> daemon)
+# --------------------------------------------------------------------------- #
+
+
+def _ui_jump_to_pool(player, ui, index: int) -> None:
+    """Overlay row click: jump to that entry of the result pool."""
+    titles = player.pool_titles()
+    if not 0 <= index < len(titles):
+        return  # the pool changed since the click; nothing sensible to do
+    player.jump_to(index)
+    LOGGER.info("pool click: jumping to track %d (%s)", index + 1, titles[index])
+    ui.set_action(f"jump #{index + 1} {titles[index]}")
+
+
+def _ui_log_pause(ui, paused: bool) -> None:
+    """Tray click: say it in the log and on the overlay (audio is dropped
+    by ``Listener.pause_event``, not here)."""
+    LOGGER.info("paused from the tray" if paused else "resumed from the tray")
+    ui.set_action("paused (tray)" if paused else "listening again")
+
+
+def _ui_switch_mic(listener, ui, index: int) -> None:
+    """Tray menu: move the live capture to input device *index*."""
+    try:
+        name = listener.capture.reopen(index)
+    except Exception as exc:
+        LOGGER.error("cannot switch to input device %s: %s", index, exc)
+        ui.set_error(f"microphone: {exc}")
+        return
+    LOGGER.info("capturing from %s (device %s)", name, index)
+    ui.set_action(f"microphone: {name}")
+
+
+def _ui_quit(listener) -> None:
+    """Tray quit: stop capture so ``listener.run()`` returns (shutdown flag
+    is already set by the tray)."""
+    LOGGER.info("quit from the tray")
+    listener.stop()
+
+
+
 def run_daemon(config: Config) -> int:
-    """Default mode: listen, match and act (milestones M4 and M5)."""
+    """Default mode: listen, match and act (milestones M4, M5 and the UI)."""
     from datetime import datetime
 
     from .aec import create_canceller
     from .asr.registry import load_backend
     from .player import MpvPlayer
     from .search import Searcher
+    from .ui import UiState, start_ui
 
     validate_actions(config)
     ensure_models(config)
@@ -574,16 +657,24 @@ def run_daemon(config: Config) -> int:
     matcher = build_matcher(config)
     log = TranscriptLog(config.behaviour.log_path, config.behaviour.log_transcripts).open()
 
+    # ---- UI (overlay + tray): disabled by behaviour.ui = false ----------
+    ui = UiState(player=player) if config.behaviour.ui else None
+    tray = None
+
     def dispatch(commands, ts: float) -> None:
         for command in commands:
             log.note(
                 f"action={command.action} query={command.query} reason={command.reason}", ts
             )
+            if ui is not None:
+                ui.set_action(f"{command.action} {command.query}".strip())
             runner.dispatch(command)
 
     def on_utterance(text: str, ts: float) -> None:
         LOGGER.info("heard: %s", text)
         log.write(text, backend.name, "final", ts)
+        if ui is not None:
+            ui.set_heard(text)
         matcher.set_playing(player.playing)
         dispatch(matcher.feed(text, ts), ts)
 
@@ -603,7 +694,19 @@ def run_daemon(config: Config) -> int:
         on_partial=on_partial,
         on_silence=on_silence,
         canceller=create_canceller(config),
+        pause_event=ui.paused if ui is not None else None,
     ).open()
+
+    if ui is not None:
+        ui.capture = listener.capture
+        tray = start_ui(
+            ui,
+            on_pool_click=lambda index: _ui_jump_to_pool(player, ui, index),
+            on_pause=lambda: _ui_log_pause(ui, True),
+            on_resume=lambda: _ui_log_pause(ui, False),
+            on_mic_pick=lambda index: _ui_switch_mic(listener, ui, index),
+            on_quit=lambda: _ui_quit(listener),
+        )
 
     example_trigger = config.trigger.words[0]
     example_verb = next(
@@ -613,11 +716,18 @@ def run_daemon(config: Config) -> int:
         f"ready. try '{example_trigger} {example_verb} <something>'. "
         f"transcripts -> {log.path}"
     )
+    if ui is not None:
+        print(
+            "overlay + tray icon active: click the tray icon to pause, "
+            "right-click it for the microphone menu or to quit"
+        )
     try:
         listener.run()
     except KeyboardInterrupt:
         print()
     finally:
+        if tray is not None:
+            tray.stop()
         listener.stop()
         log.close()
         player.close()

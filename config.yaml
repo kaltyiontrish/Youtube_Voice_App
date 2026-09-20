@@ -70,6 +70,7 @@ behaviour:
   log_level: INFO
   ignore_trigger_ms_after_play: 500
   require_same_utterance_while_playing: true   # plan2.md §8 step 3
+  ui: true                  # minimal overlay + tray icon (voiceyt.ui)
 
 commands:
   - {action: play,        verbs: [passa, toca, poe, mete],             takes_query: true}

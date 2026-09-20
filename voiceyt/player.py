@@ -482,6 +482,11 @@ class MpvPlayer:
         self.command("playlist-prev")
         return True
 
+    def jump_to(self, index: int) -> bool:
+        """Jump to playlist entry *index* (0-based; used by the UI playlist)."""
+        self.command("playlist-play-index", int(index))
+        return True
+
     def stop(self) -> bool:
         self.command("stop", raise_on_error=False)
         self._playing = False
@@ -548,6 +553,14 @@ class MpvPlayer:
         if 0 <= position < len(titles):
             return titles[position]
         return None
+
+    def pool_titles(self) -> list[str]:
+        """Thread-safe snapshot of the 5-result pool titles (for the UI playlist).
+
+        Returns a shallow copy; callers can read without holding any lock.
+        """
+        with self._title_lock:
+            return list(self._track_titles)
 
     def status(self) -> MpvStatus:
         try:

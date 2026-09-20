@@ -91,6 +91,36 @@ in a tab-separated, greppable format:
 2026-09-19T18:04:15.002	-	command	action=play query=nirvana reason=query completed in one utterance
 ```
 
+### UI: overlay + tray icon
+
+`python -m voiceyt` also starts a small always-on-top overlay and a tray icon
+(`behaviour.ui: false` in `config.yaml` turns both off; every other mode is
+head-less). The microphone stays the input - the UI only shows what happened:
+
+| Overlay | Meaning |
+|---|---|
+| green dot | listening |
+| yellow dot / big line | something was just heard (the big line is the transcript) |
+| orange dot | paused from the tray |
+| red dot / red line | the last command failed |
+
+Below the big line the overlay shows the last action plus the now-playing title
+with its pool position and volume (`youtube passa` queues the top 5 results).
+The five rows are the pool: **click one to jump to that track**. After 30 s of
+silence the window dims, after 2 min it hides itself.
+
+The tray icon (left click = pause/resume, right click = menu) offers:
+
+* **Pause / Resume** - the capture keeps running but the audio is dropped, so
+  nothing said while paused can leak into the next utterance,
+* **Microphone** - switch input device on the fly; the tick marks the current
+  device (same indices as `--list-devices`),
+* **Quit voiceyt** - same as Ctrl-C: capture, journal, mpv and the backend are
+  closed in order.
+
+There are no extra dependencies: the overlay is `tkinter` (stdlib) and the tray
+icon is a hidden win32 window driven by `ctypes`.
+
 ## 4. Milestone acceptance tests
 
 | Milestone | What to run | What proves it passed |
@@ -101,6 +131,7 @@ in a tab-separated, greppable format:
 | M3 matcher | `--replay-log logs/transcripts.log` | **zero** commands fire on real conversation; deliberate phrases all fire |
 | M4 player | `python -m voiceyt` (headphones on), speak all six commands | play/next/stop/volume all work end to end |
 | M5 echo | music through speakers for 10 minutes | zero false triggers, and `youtube pára` still works over the music |
+| UI overlay + tray | `python -m voiceyt`, speak a command, click the overlay row, use the tray menu | the overlay shows the transcript, the action, the title and the 5-row pool; a pool click jumps to that track; tray pause drops audio (nothing fires while paused); the mic submenu switches device without restarting |
 
 ## 5. Tuning workflow
 
@@ -130,6 +161,7 @@ voiceyt/
   models.py       download, cache, verify models
   bench.py        compare all backends (plan2.md §9, M2)
   transcripts.py  transcript journal + offline replay (M2 -> M3)
+  ui.py           overlay window + tray icon (tkinter + raw ctypes, no deps)
   asr/
     base.py       ASRBackend interface
     registry.py   name -> class
