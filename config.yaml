@@ -74,6 +74,7 @@ behaviour:
 commands:
   - {action: play,        verbs: [passa, toca, poe, mete],             takes_query: true}
   - {action: next,        verbs: [proximo, seguinte, outra, salta],    takes_query: false}
+  - {action: prev,        verbs: [anterior, volta],                   takes_query: false}
   - {action: stop,        verbs: [para, pausa, chega],                 takes_query: false}
   - {action: volume_up,   verbs: ["mais alto", aumenta, "sobe o som"], takes_query: false}
   - {action: volume_down, verbs: ["mais baixo", baixa, "baixa o som"], takes_query: false}

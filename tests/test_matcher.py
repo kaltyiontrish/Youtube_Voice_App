@@ -16,6 +16,7 @@ COMMANDS = (
     CommandSpec(
         action="next", verbs=("proximo", "seguinte", "outra", "salta"), takes_query=False
     ),
+    CommandSpec(action="prev", verbs=("anterior", "volta"), takes_query=False),
     CommandSpec(action="stop", verbs=("para", "pausa", "chega"), takes_query=False),
     CommandSpec(
         action="volume_up", verbs=("mais alto", "aumenta", "sobe o som"), takes_query=False
@@ -86,6 +87,10 @@ class SingleUtteranceTests(unittest.TestCase):
     def test_verb_without_query_fires_immediately(self) -> None:
         commands = make_matcher().feed("youtube próximo", 0.0)
         self.assertEqual(commands[0].action, "next")
+
+    def test_prev_fires_on_anterior(self) -> None:
+        commands = make_matcher().feed("youtube anterior", 0.0)
+        self.assertEqual(commands[0].action, "prev")
 
     def test_multiword_verb_beats_its_prefix(self) -> None:
         commands = make_matcher().feed("youtube mais alto", 0.0)
@@ -164,6 +169,8 @@ class OrdinaryConversationTests(unittest.TestCase):
             "isso esta mais alto do que devia",
             "para mim esta bem",
             "proximo domingo vou a lisboa",
+            "o anterior dono do carro",
+            "volta para casa depois das seis",
             "pausa para pensar",
             "aumenta a luz da sala",
             "baixa o preco do produto",

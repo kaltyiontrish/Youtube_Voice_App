@@ -44,7 +44,10 @@ the loader path automatically before any backend is imported - both CTranslate2
 (whisper) and ONNX Runtime need them, and without this step you get
 `cublas64_12.dll not found` / `cudnn_ops64_9.dll not found`.
 
-Install mpv, e.g. `winget install mpv` or `scoop install mpv`, then check:
+Install mpv system-wide (`winget install mpv` or `scoop install mpv`), or just
+drop the portable build into `tools/mpv/` (e.g. from the
+[shinchiro win-build releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases) -
+the player picks it up automatically). Then check:
 
 ```powershell
 mpv --version

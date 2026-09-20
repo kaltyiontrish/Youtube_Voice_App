@@ -16,3 +16,6 @@ captures/
 
 # Local overrides
 config.local.yaml
+
+# portable mpv build (downloaded separately, too big for git)
+tools/

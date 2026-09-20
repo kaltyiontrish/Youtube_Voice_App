@@ -2,9 +2,10 @@
 
 One mpv instance is spawned at daemon start with ``--idle=yes`` and an
 ``--input-ipc-server`` pipe; it stays alive between commands and is restarted
-only if the pipe dies.  Commands and responses are JSON objects, one per line,
-matched by ``request_id``; a reader thread keeps the pipe drained so events
-(end-file, idle) update the playing state without blocking the caller.
+only if the pipe dies.  Command replies are read back synchronously on the
+same connection that sent the request, while a second connection carries the
+broadcast events into the playing state - the historical single-handle design
+deadlocked on Windows, where one blocking reader starves every writer.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import itertools
 import json
 import logging
 import os
-import queue
 import shutil
 import subprocess
 import sys
@@ -72,14 +72,21 @@ class MpvPlayer:
         self.start_timeout_s = float(start_timeout_s)
 
         self._process: subprocess.Popen[bytes] | None = None
-        self._pipe: Any = None
+        self._pipe: Any = None        # command connection: write + read own reply
+        self._event_pipe: Any = None  # event connection: owned by the reader thread
         self._reader: threading.Thread | None = None
-        self._lock = threading.RLock()
-        self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self._cmd_lock = threading.Lock()
         self._ids = itertools.count(1)
         self._playing = False
         self._queue_generation = 0
         self._stopping = threading.Event()
+        self._reader_stop = threading.Event()
+        self._reader_done = threading.Event()
+        # Display titles per playlist index: direct googlevideo URLs have no
+        # metadata, so media-title would show the raw URL.  The reader thread
+        # re-applies the matching title on every playback-restart event.
+        self._title_lock = threading.Lock()
+        self._track_titles: list[str] = []
 
     # -- lifecycle ------------------------------------------------------- #
 
@@ -89,11 +96,19 @@ class MpvPlayer:
         if resolved:
             return resolved
         candidate = Path(self.mpv_path)
+        if not candidate.is_absolute() and not candidate.is_file():
+            # `mpv` is often installed as a directory path-lessly, so check the
+            # local fallback before raising the usual PATH error.
+            exe = "mpv.exe" if sys.platform.startswith("win") else "mpv"
+            for root in (Path(__file__).resolve().parent.parent, Path.cwd()):
+                fallback = root / "tools" / "mpv" / exe
+                if fallback.is_file():
+                    return str(fallback)
         if candidate.is_file():
             return str(candidate)
         raise PlayerError(
-            f"mpv executable {self.mpv_path!r} not found; install mpv and put it on PATH "
-            f"(or set player.mpv_path in config.yaml)"
+            f"mpv executable {self.mpv_path!r} not found; install mpv and put it on PATH, "
+            f"drop the portable build into tools/mpv/, or set player.mpv_path in config.yaml"
         )
 
     def start(self) -> "MpvPlayer":
@@ -110,15 +125,12 @@ class MpvPlayer:
         args = [binary, f"--input-ipc-server={self.ipc_path}", "--idle=yes"]
         if self.audio_only:
             args.append("--no-video")
+        # voiceyt resolves direct media URLs itself (Searcher.resolve); mpv's
+        # ytdl hook would re-extract the googlevideo URL - slow and dependent
+        # on a JS runtime - so switch it off.  extra_args may override (last
+        # option wins in mpv).
+        args.append("--ytdl=no")
         args.extend(self.extra_args)
-        # Let mpv's own ytdl hook find the yt-dlp installed next to the
-        # interpreter that runs this daemon.
-        env = dict(os.environ)
-        script_dir = str(Path(sys.executable).parent)
-        env["PATH"] = script_dir + os.pathsep + env.get("PATH", "")
-        ytdlp = Path(script_dir) / ("yt-dlp.exe" if sys.platform.startswith("win") else "yt-dlp")
-        if ytdlp.is_file():
-            args.append(f"--script-opts=ytdl_hook-ytdl_path={ytdlp}")
 
         LOGGER.debug("starting mpv: %s", " ".join(args))
         creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0
@@ -127,32 +139,78 @@ class MpvPlayer:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=env,
             creationflags=creation,
         )
         self._stopping.clear()
-        self._wait_for_pipe()
-        self._reader = threading.Thread(target=self._read_loop, name="mpv-ipc", daemon=True)
+        self._reader_stop.clear()
+        # Two independent connections: a synchronous pipe handle blocks on both
+        # reads and writes, so the event reader and command writer cannot share
+        # one handle without wedging each other.  mpv supports multiple IPC
+        # clients; it broadcasts events to each connection and sends each reply
+        # only to the asking client.
+        self._pipe = self._open_verified_connection()
+        self._event_pipe = self._open_verified_connection()
+        self._reader = threading.Thread(
+            target=self._read_loop, args=(self._event_pipe,), name="mpv-ipc", daemon=True
+        )
         self._reader.start()
         return self
 
-    def _wait_for_pipe(self) -> None:
+    def _open_verified_connection(self) -> Any:
+        """Open an IPC connection that mpv actually answers on.
+
+        mpv creates the named pipe before its IPC loop services it; a client
+        that connects in that window blocks forever on its first write.  So
+        connect in a worker thread, ping mpv, and only keep a connection that
+        replies inside the probe window.  Verified pings also confirm both
+        connections survive mpv's early startup.
+        """
         deadline = time.monotonic() + self.start_timeout_s
         last_error: Exception | None = None
+        ping = b'{"command":["get_property","mpv-version"],"request_id":0}\n'
+        attempt = 0
         while time.monotonic() < deadline:
             if self._process is not None and self._process.poll() is not None:
                 raise PlayerError(
                     f"mpv exited immediately with code {self._process.returncode}; "
                     f"check player.mpv_path and player.extra_args"
                 )
-            try:
-                self._pipe = open(self.ipc_path, "r+b", buffering=0)
-                return
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.1)
+            result: dict[str, Any] = {}
+
+            def probe() -> None:
+                pipe = None
+                try:
+                    pipe = open(self.ipc_path, "r+b", buffering=0)
+                    pipe.write(ping)
+                    line = pipe.readline()
+                    if not line:
+                        result["error"] = OSError("pipe accepted the ping but never answered")
+                        return
+                    result["pipe"] = pipe
+                except OSError as exc:
+                    result["error"] = exc
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
+
+            probe_thread = threading.Thread(target=probe, name="mpv-ipc-probe", daemon=True)
+            probe_thread.start()
+            # Bounded: a wedged probe is abandoned (its handle is closed once
+            # mpv finishes init and EOFs it, or on GC) and we simply open a
+            # fresh connection on the next iteration.
+            probe_thread.join(timeout=2.0)
+            if "pipe" in result:
+                if attempt > 0:
+                    LOGGER.debug("IPC connection verified after %d attempt(s)", attempt + 1)
+                return result["pipe"]
+            last_error = result.get("error") or TimeoutError("probe did not finish")
+            attempt += 1
+            time.sleep(0.2)
+        LOGGER.error("mpv IPC probe failed: %s", last_error)
         raise PlayerError(
-            f"mpv did not create its IPC pipe {self.ipc_path!r} within "
+            f"mpv did not answer on its IPC pipe {self.ipc_path!r} within "
             f"{self.start_timeout_s:.0f}s ({last_error})"
         )
 
@@ -174,6 +232,12 @@ class MpvPlayer:
                 pipe.close()
             except OSError:  # pragma: no cover
                 pass
+        event_pipe, self._event_pipe = self._event_pipe, None
+        if event_pipe is not None and event_pipe is not pipe:
+            try:
+                event_pipe.close()
+            except OSError:  # pragma: no cover
+                pass
         process, self._process = self._process, None
         if process is not None:
             try:
@@ -190,40 +254,39 @@ class MpvPlayer:
 
     # -- IPC ------------------------------------------------------------- #
 
-    def _read_loop(self) -> None:
-        """Drain the pipe: route responses to waiters, events to the state."""
-        pipe = self._pipe
-        while pipe is not None and not self._stopping.is_set():
+    def _read_loop(self, event_pipe: Any) -> None:
+        """Drain the event connection and flip the playing state.
+
+        This connection never sends commands: every line it receives is a
+        broadcast event, so replies to request_id 0 probes are harmless.
+        """
+        try:
+            while not self._stopping.is_set():
+                try:
+                    line = event_pipe.readline()
+                except (OSError, ValueError):
+                    break
+                if not line:
+                    break
+                try:
+                    payload = json.loads(line.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                # Replies (startup probes) carry no event key; only events do.
+                event = payload.get("event")
+                if event:
+                    self._handle_event(str(event))
+        finally:
+            LOGGER.debug("mpv IPC reader finished")
+            self._playing = False
+            if event_pipe is self._event_pipe:
+                self._event_pipe = None
             try:
-                line = pipe.readline()
-            except (OSError, ValueError):
-                break
-            if not line:
-                break
-            try:
-                payload = json.loads(line.decode("utf-8", "replace"))
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            request_id = payload.get("request_id")
-            if request_id is not None:
-                waiter = self._pending.get(int(request_id))
-                if waiter is not None:
-                    try:
-                        waiter.put_nowait(payload)
-                    except queue.Full:  # pragma: no cover
-                        pass
-                continue
-            event = payload.get("event")
-            if event:
-                self._handle_event(str(event))
-        LOGGER.debug("mpv IPC reader finished")
-        self._playing = False
-        for waiter in list(self._pending.values()):
-            try:
-                waiter.put_nowait({"error": "mpv IPC pipe closed"})
-            except queue.Full:  # pragma: no cover
+                if event_pipe is not self._pipe:
+                    event_pipe.close()
+            except (OSError, ValueError):  # pragma: no cover - best effort
                 pass
 
     def _handle_event(self, event: str) -> None:
@@ -232,34 +295,93 @@ class MpvPlayer:
         elif event in ("end-file", "idle", "shutdown"):
             self._playing = False
 
+    def _reconnect_command_locked(self) -> Any:
+        """Reopen the command connection; the caller must hold ``_cmd_lock``."""
+        process = self._process
+        if process is None or self._stopping.is_set():
+            raise PlayerError("mpv is not running")
+        if process.poll() is not None:
+            raise PlayerError(f"mpv exited with code {process.returncode}; restart it")
+        pipe = self._open_verified_connection()
+        self._pipe = pipe
+        return pipe
+
     def command(self, *args: Any, timeout: float = 5.0, raise_on_error: bool = True) -> Any:
-        """Send one IPC command and return its ``data`` payload."""
-        with self._lock:
-            if self._pipe is None:
-                raise PlayerError("mpv is not running")
+        """Send one IPC command on the command connection, read its reply.
+
+        The command connection is never read by anyone else, so the reply to
+        this request is simply the next matching line on it.  Calls are
+        serialised under one lock (foreground player calls plus the background
+        preload thread) so replies always match the command just sent.
+
+        mpv broadcasts events to every IPC client, so this connection also
+        receives event lines; only the line echoing our ``request_id`` is the
+        reply, everything else is dropped (the dedicated event connection
+        handles the same events anyway).
+
+        The exchange runs in a worker thread and is joined with a deadline: on
+        Windows a synchronous pipe read cannot be made non-blocking, so the
+        only bounded option is to abandon the worker (a daemon thread wedged
+        on a handle mpv will EOF or GC will reap) and detach the handle so the
+        next call opens a fresh, verified connection.
+        """
+        with self._cmd_lock:
+            pipe = self._pipe
+            if pipe is None or getattr(pipe, "closed", False):
+                try:
+                    pipe = self._reconnect_command_locked()
+                except PlayerError:
+                    raise PlayerError("mpv is not running") from None
             request_id = next(self._ids)
-            waiter: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-            self._pending[request_id] = waiter
             message = json.dumps({"command": list(args), "request_id": request_id}) + "\n"
-            try:
-                self._pipe.write(message.encode("utf-8"))
-            except OSError as exc:
-                self._pending.pop(request_id, None)
-                self._pipe = None
-                raise PlayerError(f"lost the mpv IPC pipe: {exc}") from exc
-        try:
-            response = waiter.get(timeout=timeout)
-        except queue.Empty:
-            raise PlayerError(f"mpv did not answer {args!r} within {timeout:.0f}s") from None
-        finally:
-            with self._lock:
-                self._pending.pop(request_id, None)
-        error = response.get("error")
-        if error not in (None, "success"):
-            if raise_on_error:
-                raise PlayerError(f"mpv refused {args!r}: {error}")
-            LOGGER.debug("mpv error for %r: %s", args, error)
-        return response.get("data")
+            result: dict[str, Any] = {}
+
+            def exchange() -> None:
+                try:
+                    pipe.write(message.encode("utf-8"))
+                    buf = b""
+                    while True:
+                        chunk = pipe.read(4096)
+                        if chunk == b"":
+                            result["error"] = "mpv closed the connection"
+                            return
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, _, buf = buf.partition(b"\n")
+                            try:
+                                payload = json.loads(line.decode("utf-8", "replace"))
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                isinstance(payload, dict)
+                                and payload.get("request_id") == request_id
+                            ):
+                                result["response"] = payload
+                                return
+                            # Event or foreign reply on this connection: drop it.
+                except (OSError, ValueError) as exc:
+                    result["error"] = str(exc)
+
+            worker = threading.Thread(target=exchange, name="mpv-ipc-cmd", daemon=True)
+            worker.start()
+            worker.join(timeout=timeout)
+            if "response" not in result:
+                # Timed out, errored, or mpv wedged: detach the handle so the
+                # next call opens a fresh connection instead of reading a
+                # stale reply.  The abandoned worker dies with mpv (EOF) or
+                # the interpreter (daemon thread).
+                if pipe is self._pipe:
+                    self._pipe = None
+                if "error" in result:
+                    raise PlayerError(f"lost the mpv IPC pipe: {result['error']}")
+                raise PlayerError(f"mpv did not answer {args!r} within {timeout:.0f}s")
+            response = result["response"]
+            error = response.get("error")
+            if error not in (None, "success"):
+                if raise_on_error:
+                    raise PlayerError(f"mpv refused {args!r}: {error}")
+                LOGGER.debug("mpv error for %r: %s", args, error)
+            return response.get("data")
 
     # -- playback -------------------------------------------------------- #
 
@@ -287,9 +409,24 @@ class MpvPlayer:
         self._queue_generation += 1
         generation = self._queue_generation
         first = searcher.resolve(results[0])
+        # Direct googlevideo URLs carry no metadata, so mpv would show the raw
+        # URL as the track name; titles are re-applied per track on
+        # playback-restart events (see _apply_track_title).
+        with self._title_lock:
+            self._track_titles = [results[0].title]
         self.command("playlist-clear", raise_on_error=False)
         self.load(first, "replace")
         LOGGER.info("playing: %s", results[0].title)
+        if not self._wait_for_start(6.0):
+            # Rare race: the load is accepted but the stream never starts
+            # (transient fetch failure).  Re-resolve and try exactly once.
+            LOGGER.warning("track did not start; re-resolving once: %s", results[0].title)
+            try:
+                self.load(searcher.resolve(results[0]), "replace")
+            except SearchError as exc:
+                raise PlayerError(f"could not re-resolve {results[0].title!r}: {exc}") from exc
+            if not self._wait_for_start(6.0):
+                LOGGER.warning("track still not playing; leaving it to mpv")
         if len(results) > 1:
             threading.Thread(
                 target=self._preload,
@@ -297,6 +434,23 @@ class MpvPlayer:
                 name="mpv-preload",
                 daemon=True,
             ).start()
+
+    def _wait_for_start(self, timeout: float) -> bool:
+        """True once mpv reports a playlist position and playing state."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._process is not None and self._process.poll() is not None:
+                return False
+            try:
+                position = self.command(
+                    "get_property", "playlist-pos", timeout=2.0, raise_on_error=False
+                )
+                if isinstance(position, int) and position >= 0:
+                    return True
+            except PlayerError:
+                return False
+            time.sleep(0.25)
+        return False
 
     def _preload(self, items: list[SearchResult], searcher: Searcher, generation: int) -> None:
         """Resolve the remaining hits in the background so 'next' is instant."""
@@ -313,6 +467,8 @@ class MpvPlayer:
                 return
             try:
                 self.load(stream, "append")
+                with self._title_lock:
+                    self._track_titles.append(item.title)
                 LOGGER.info("queued: %s", item.title)
             except PlayerError as exc:
                 LOGGER.warning("could not queue %r: %s", item.title, exc)
@@ -320,6 +476,10 @@ class MpvPlayer:
 
     def next_track(self) -> bool:
         self.command("playlist-next")
+        return True
+
+    def prev_track(self) -> bool:
+        self.command("playlist-prev")
         return True
 
     def stop(self) -> bool:
@@ -367,11 +527,25 @@ class MpvPlayer:
         return self._playing
 
     def current_title(self) -> str | None:
+        """Friendly title of the current entry, tracked locally per playlist index.
+
+        mpv's ``media-title`` for a direct googlevideo URL is the raw URL tail
+        and its metadata updates clobber any value we set, so we keep our own
+        list (see :meth:`play_results`) and map ``playlist-pos`` into it.
+        """
         try:
-            value = self.command("get_property", "media-title", timeout=2.0, raise_on_error=False)
+            position = self.command(
+                "get_property", "playlist-pos", timeout=2.0, raise_on_error=False
+            )
         except PlayerError:
             return None
-        return str(value) if value else None
+        if not isinstance(position, int) or position < 0:
+            return None
+        with self._title_lock:
+            titles = list(self._track_titles)
+        if 0 <= position < len(titles):
+            return titles[position]
+        return None
 
     def status(self) -> MpvStatus:
         try:
@@ -381,9 +555,11 @@ class MpvPlayer:
             )
         except PlayerError:
             return MpvStatus(playing=False, playlist_pos=None, volume=None, title=None)
+        pos = int(position) if position is not None else None
         return MpvStatus(
-            playing=position is not None and not bool(paused),
-            playlist_pos=int(position) if position is not None else None,
+            # playlist-pos is -1 when the playlist is empty/stopped: not playing
+            playing=pos is not None and pos >= 0 and not bool(paused),
+            playlist_pos=pos,
             volume=round(self.volume(), 1),
             title=self.current_title(),
         )

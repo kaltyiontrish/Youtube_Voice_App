@@ -146,7 +146,7 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(known_actions()),
-            ["next", "play", "stop", "volume_down", "volume_up"],
+            ["next", "play", "prev", "stop", "volume_down", "volume_up"],
         )
 
     def test_shipped_config_has_known_actions(self) -> None:

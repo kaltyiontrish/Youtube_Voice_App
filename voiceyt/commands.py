@@ -149,6 +149,12 @@ def _next(runner: CommandRunner, command: Command) -> bool:
     return runner.player.next_track()
 
 
+@handler("prev")
+def _prev(runner: CommandRunner, command: Command) -> bool:
+    runner._ensure_player()
+    return runner.player.prev_track()
+
+
 @handler("stop")
 def _stop(runner: CommandRunner, command: Command) -> bool:
     return runner.player.stop()
