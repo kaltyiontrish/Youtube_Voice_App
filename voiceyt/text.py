@@ -41,6 +41,16 @@ def strip_accents(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
+def romanize(text: str) -> str:
+    """Transliterate Cyrillic to Latin, keeping everything else as-is.
+
+    Display variant of :func:`normalize`'s first step: no lower-casing, no
+    punctuation changes - just so the UI never shows Cyrillic the matcher
+    would not act on the same way.
+    """
+    return text.translate(_CYR_TABLE) if text else text
+
+
 def normalize(text: str) -> str:
     """Lower-case, de-accent, transliterate, de-punctuate and collapse *text*."""
     if not text:

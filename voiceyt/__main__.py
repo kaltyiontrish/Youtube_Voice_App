@@ -631,6 +631,7 @@ def run_daemon(config: Config) -> int:
     from .asr.registry import load_backend
     from .player import MpvPlayer
     from .search import Searcher
+    from .text import romanize
     from .ui import UiState, start_ui
 
     validate_actions(config)
@@ -674,7 +675,9 @@ def run_daemon(config: Config) -> int:
         LOGGER.info("heard: %s", text)
         log.write(text, backend.name, "final", ts)
         if ui is not None:
-            ui.set_heard(text)
+            # display the romanized form: the matcher transliterates too, so
+            # the overlay never shows Cyrillic the user cannot read
+            ui.set_heard(romanize(text))
         matcher.set_playing(player.playing)
         dispatch(matcher.feed(text, ts), ts)
 
