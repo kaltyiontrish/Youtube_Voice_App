@@ -59,19 +59,31 @@ class ParakeetBackend(BaseBackend):
     # -- model download -------------------------------------------------- #
 
     def download(self, config: Config) -> None:
-        """Fetch the ONNX graphs into ``models/parakeet``."""
-        import onnx_asr
+        """Fetch the ONNX graphs into ``models/parakeet``.
+
+        onnx-asr's ``load_model(model, path)`` is local-only in the pinned
+        version (its download fallback does not catch ModelFileNotFoundError),
+        so the files are fetched with snapshot_download using the same repo
+        onnx-asr maps the model id to (resolver.py REPO_IDS).
+        """
+        import onnx_asr  # noqa: F401 - keeps the import-error surface identical
+        from huggingface_hub import snapshot_download
 
         settings = config.asr.parakeet
         target = self.local_dir(config)
         target.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("downloading %s (onnx-asr) -> %s", settings.model_id, target)
+        LOGGER.info("downloading %s -> %s", settings.model_id, target)
         try:
-            onnx_asr.load_model(
-                settings.model_id,
-                str(target),
-                quantization=settings.quantization,
-                providers=self.providers(config),
+            from onnx_asr.resolver import model_repos
+
+            repo = model_repos[settings.model_id]
+        except (ImportError, KeyError):  # pragma: no cover - version drift
+            repo = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+        try:
+            snapshot_download(
+                repo,
+                local_dir=target,
+                allow_patterns=["*.onnx*", "*.ort", "*.json", "*.yaml", "*.txt"],
             )
         except Exception as exc:
             raise AsrError(f"could not download {settings.model_id}: {exc}") from exc

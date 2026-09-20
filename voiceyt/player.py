@@ -512,7 +512,9 @@ class MpvPlayer:
             )
         except PlayerError:
             return False
-        if position is None:
+        # After `stop` mpv reports playlist-pos = -1 while idle; only a real
+        # entry (>= 0) counts as playing.
+        if position is None or int(position) < 0:
             return False
         return not bool(paused)
 
