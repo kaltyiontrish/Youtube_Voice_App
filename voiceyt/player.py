@@ -495,6 +495,21 @@ class MpvPlayer:
         self.command("playlist-play-index", int(index))
         return True
 
+    def unpause(self) -> bool:
+        """Resume after pause/stop: unpause, else replay current playlist entry."""
+        self.command("set_property", "pause", False, raise_on_error=False)
+        try:
+            position = self.command(
+                "get_property", "playlist-pos", timeout=2.0, raise_on_error=False
+            )
+        except PlayerError:
+            position = None
+        if isinstance(position, int) and position >= 0:
+            self.command("playlist-play-index", position, raise_on_error=False)
+            self.command("set_property", "pause", False, raise_on_error=False)
+        self._playing = True
+        return True
+
     def stop(self) -> bool:
         self.command("stop", raise_on_error=False)
         self._playing = False

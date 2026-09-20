@@ -274,6 +274,13 @@ class Overlay(tk.Tk):
         self._born = time.monotonic()        # for the startup quiet timer
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}{WINDOW_POS}")
         self.show()                          # visible at startup ("listening")
+        # Drag a frameless window by holding the left button anywhere and
+        # moving: pool rows still get their click when there is no motion.
+        self._drag_xy: tuple[int, int] | None = None
+        self._drag_moved = False
+        self.bind("<ButtonPress-1>", self._drag_start)
+        self.bind("<B1-Motion>", self._drag_move)
+        self.bind("<ButtonRelease-1>", self._drag_end)
 
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=14, pady=(10, 4))
@@ -330,18 +337,35 @@ class Overlay(tk.Tk):
                 cursor="hand2", font=pool_font,
             )
             label.pack(fill="x", padx=14, pady=1)
-            label.bind("<Button-1>", lambda _event, index=row: self._on_pool_click(index))
+            # Release (not press): a press that turns into a drag must not
+            # change tracks; _on_pool_click checks the _drag_moved flag.
+            label.bind("<ButtonRelease-1>", lambda _event, index=row: self._on_pool_click(index))
             self._pool_labels.append(label)
 
     # -- events ----------------------------------------------------------
 
     def _on_pool_click(self, index: int) -> None:
-        if self.on_pool_click is None:
+        if self._drag_moved or self.on_pool_click is None:
             return
         try:
             self.on_pool_click(index)
         except Exception:
             LOGGER.exception("pool click handler failed")
+
+    def _drag_start(self, event) -> None:
+        self._drag_xy = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+        self._drag_moved = False
+
+    def _drag_move(self, event) -> None:
+        if self._drag_xy is None:  # click without motion: still a pool click
+            return
+        self._drag_moved = True
+        self.geometry(f"+{event.x_root - self._drag_xy[0]}+{event.y_root - self._drag_xy[1]}")
+
+    def _drag_end(self, _event) -> None:
+        # A pool-row click fires on press; when the press turned into a drag,
+        # no rows change.  The flag only suppresses the pending click.
+        self._drag_xy = None
 
     def show(self) -> None:
         """Reveal the overlay (a new utterance, an error, startup)."""

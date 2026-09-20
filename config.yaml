@@ -80,5 +80,6 @@ commands:
   - {action: next,        verbs: [next, proximo, seguinte, outra, salta],    takes_query: false}
   - {action: prev,        verbs: [previous, anterior, volta],                takes_query: false}
   - {action: stop,        verbs: [stop, para, pausa, chega],                 takes_query: false}
+  - {action: resume,      verbs: [continue, continua, retoma],               takes_query: false}
   - {action: volume_up,   verbs: [louder, "mais alto", aumenta, "sobe o som"], takes_query: false}
   - {action: volume_down, verbs: [quieter, "mais baixo", baixa, "baixa o som"], takes_query: false}

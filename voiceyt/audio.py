@@ -251,7 +251,9 @@ class AudioCapture:
             channels=1,
             dtype="float32",
             samplerate=self._device_rate,
-            blocksize=max(1, int(self._device_rate * self._block_seconds)),
+            blocksize=max(
+                1, int(self._device_rate * getattr(self, "_block_seconds", 0.032))
+            ),
             callback=self._callback,
         )
 

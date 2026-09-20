@@ -88,7 +88,9 @@ DEFAULTS: dict[str, Any] = {
     "commands": [
         {"action": "play", "verbs": ["passa", "toca", "poe", "mete"], "takes_query": True},
         {"action": "next", "verbs": ["proximo", "seguinte", "outra", "salta"], "takes_query": False},
+        {"action": "prev", "verbs": ["previous", "anterior", "volta"], "takes_query": False},
         {"action": "stop", "verbs": ["para", "pausa", "chega"], "takes_query": False},
+        {"action": "resume", "verbs": ["continue", "continua", "retoma"], "takes_query": False},
         {"action": "volume_up", "verbs": ["mais alto", "aumenta", "sobe o som"], "takes_query": False},
         {"action": "volume_down", "verbs": ["mais baixo", "baixa", "baixa o som"], "takes_query": False},
     ],

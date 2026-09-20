@@ -160,6 +160,12 @@ def _stop(runner: CommandRunner, command: Command) -> bool:
     return runner.player.stop()
 
 
+@handler("resume")
+def _resume(runner: CommandRunner, command: Command) -> bool:
+    runner._ensure_player()
+    return runner.player.unpause()
+
+
 @handler("volume_up")
 def _volume_up(runner: CommandRunner, command: Command) -> bool:
     return runner.player.volume_delta(runner.config.player.volume_step)
