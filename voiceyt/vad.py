@@ -21,6 +21,7 @@ import onnxruntime as ort
 LOGGER = logging.getLogger(__name__)
 
 WINDOW_SAMPLES = 512  # Silero's fixed step size at 16 kHz (32 ms)
+CONTEXT_SAMPLES = 64  # Silero v5: 64-sample context prepended to every window
 PRE_ROLL_MS = 200     # audio kept from before speech was detected
 
 
@@ -60,6 +61,7 @@ class SileroVad:
         self._input_names = {item.name for item in self._session.get_inputs()}
         self._has_sr = "sr" in self._input_names
         self._state = self._empty_state()
+        self._context = np.zeros(CONTEXT_SAMPLES, dtype=np.float32)
 
     @staticmethod
     def _empty_state() -> np.ndarray:
@@ -67,20 +69,29 @@ class SileroVad:
 
     def reset(self) -> None:
         self._state = self._empty_state()
+        self._context = np.zeros(CONTEXT_SAMPLES, dtype=np.float32)
 
     def probability(self, window: np.ndarray) -> float:
-        """Speech probability for exactly one 512-sample window."""
+        """Speech probability for exactly one 512-sample window.
+
+        The v5 graph wants ``context + window`` (576 samples): the trailing
+        64 samples of the previous call are prepended, exactly like the
+        official ``OnnxWrapper`` does.  Feeding the bare 512 samples made the
+        model return a constant ~0.001 (speech scored like silence).
+        """
         samples = np.asarray(window, dtype=np.float32).reshape(-1)
         if samples.size != WINDOW_SAMPLES:
             raise ValueError(f"Silero needs exactly {WINDOW_SAMPLES} samples")
+        fed = np.concatenate([self._context, samples])
         feeds: dict[str, np.ndarray] = {
-            "input": samples.reshape(1, -1),
+            "input": fed.reshape(1, -1),
             "state": self._state,
         }
         if self._has_sr:
             feeds["sr"] = np.array(16000, dtype=np.int64)
         outputs = self._session.run(None, feeds)
         self._state = np.asarray(outputs[1], dtype=np.float32)
+        self._context = fed[-CONTEXT_SAMPLES:].copy()
         return float(np.asarray(outputs[0]).reshape(-1)[0])
 
     def probability_of(self, audio: np.ndarray) -> float:
