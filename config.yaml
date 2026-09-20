@@ -17,13 +17,15 @@ aec:
   stream_delay_ms: 0      # extra alignment offset applied to the reference
 
 asr:
-  backend: parakeet       # whisper | parakeet | nemotron (set from --bench results)
+  backend: whisper        # whisper | parakeet | nemotron (set from --bench results)
   models_dir: ./models
-  device: cuda            # cuda | cpu
-  language: pt            # forced for whisper: auto-detect drifts to Spanish
+  device: cpu             # cuda | cpu (cpu: onnx CUDA provider unavailable here)
+  language: en            # pinned: whisper can only answer in this language;
+                          # parakeet auto-detects per utterance and drifts to
+                          # russian on short clips (proven 2026-09-20)
   whisper:
     model: small          # any faster-whisper size or a local directory name
-    compute_type: float16
+    compute_type: int8    # int8 = fastest on cpu
     beam_size: 1          # greedy keeps latency down (faster-whisper default: 5)
     condition_on_previous_text: false
   parakeet:
@@ -44,7 +46,7 @@ vad:
   max_utterance_s: 25     # hard cap, keeps batch backends inside their window
 
 trigger:
-  words: [youtube, "you tube", iutube, "u tube", utube, yutub, yutube, "yu tube"]
+  words: [youtube, "you tube", iutube, "u tube", utube]
   trigger_window_ms: 1500   # how long a verb is still accepted after the trigger
   silence_end_ms: 800       # silence that ends a query early
   query_max_ms: 6000        # hard cap on collecting a query
@@ -74,7 +76,7 @@ behaviour:
 
 commands:
   # English verbs first (primary); the pt-PT spellings stay as aliases.
-  - {action: play,        verbs: [play, passa, toca, poe, mete, pley],       takes_query: true}
+  - {action: play,        verbs: [play, passa, toca, poe, mete],             takes_query: true}
   - {action: next,        verbs: [next, proximo, seguinte, outra, salta],    takes_query: false}
   - {action: prev,        verbs: [previous, anterior, volta],                takes_query: false}
   - {action: stop,        verbs: [stop, para, pausa, chega],                 takes_query: false}
