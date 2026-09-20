@@ -141,6 +141,14 @@ class MpvPlayer:
             stderr=subprocess.DEVNULL,
             creationflags=creation,
         )
+        if sys.platform.startswith("win"):
+            from .winjob import assign_kill_on_close
+
+            # kernel-level safety net: whatever kills voiceyt (console X,
+            # crash, taskkill) also kills mpv, so music can never outlive us
+            if not assign_kill_on_close(self._process._handle):
+                LOGGER.warning("mpv is not in a kill-on-close job; if voiceyt "
+                               "dies unexpectedly mpv may keep playing")
         self._stopping.clear()
         self._reader_stop.clear()
         # Two independent connections: a synchronous pipe handle blocks on both
