@@ -268,8 +268,9 @@ class Overlay(tk.Tk):
         self.overrideredirect(True)          # no title bar, no taskbar entry
         self.attributes("-topmost", True)
         self.configure(bg=BG)
+        self._born = time.monotonic()        # for the startup quiet timer
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}{WINDOW_POS}")
-        self.withdraw()                      # appears when there is news
+        self.show()                          # visible at startup ("listening")
 
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=14, pady=(10, 4))
@@ -391,6 +392,9 @@ class Overlay(tk.Tk):
                 self._hidden = True
             elif quiet <= HIDE_AFTER_S:
                 self.attributes("-alpha", FADE_ALPHA if quiet > FADE_AFTER_S else 1.0)
+        elif now - self._born > HIDE_AFTER_S and not self._hidden:
+            self.withdraw()                  # idle since startup: hide too
+            self._hidden = True
 
         self.after(POLL_MS, self._poll_ui)
 
