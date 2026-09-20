@@ -299,6 +299,10 @@ class Overlay(tk.Tk):
         # to "busy" while you speak (basic "is audio arriving?" feedback)
         self._meter = tk.Canvas(self, height=4, bg=BG, highlightthickness=0)
         self._meter.pack(fill="x", padx=14, pady=(0, 2))
+        # dim full-width track first (always visible), fill on top of it
+        self._meter.create_rectangle(
+            0, 0, WINDOW_WIDTH - 28, 4, fill=SEPARATOR, width=0
+        )
         self._meter_id = self._meter.create_rectangle(
             0, 0, 0, 4, fill=DOT_IDLE, width=0
         )
@@ -434,7 +438,12 @@ class Overlay(tk.Tk):
             label = "paused"
         if label and playing:
             return f"{label}  \u2022  {playing}"
-        return label or playing or "listening"
+        if label or playing:
+            return label or playing
+        # idle: prove which microphone is being listened to
+        mic = getattr(self.ui_state.capture, "device_name", "") \
+            if self.ui_state.capture is not None else ""
+        return f"listening \u2022 {mic}" if mic else "listening (no microphone)"
 
     def _now_playing(self) -> str:
         player = self.ui_state.player
