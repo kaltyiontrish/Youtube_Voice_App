@@ -36,7 +36,13 @@ obligations of each are clear.
    Licence  : MIT. The ONNX graph (about 2 MB) is downloaded directly, so PyTorch
               is not needed.
 
-6. mpv
+6. Models: Vosk small English + Portuguese (alphacephei/vosk-api)
+-----------------------------------------------------------
+   Source   : https://alphacephei.com/vosk/models
+              (vosk-model-small-en-us-0.15, vosk-model-small-pt-0.3)
+   Licence  : Apache-2.0 (models) / Apache-2.0 (vosk-api runner)
+
+7. mpv
 -----------------------------------------------------------
    Licence  : GPLv2+/LGPL (mpv itself). It is an external program invoked over
               JSON IPC; it is not linked into or redistributed with voiceyt.

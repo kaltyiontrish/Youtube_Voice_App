@@ -206,9 +206,8 @@ Offline unit tests (no microphone, GPU or models needed):
    `behaviour.require_same_utterance_while_playing`,
    `asr.whisper.beam_size/condition_on_previous_text`, `aec.frame_ms/stream_delay_ms`.
    Every timing and path still comes from config; no magic numbers in code.
-7. **`asr.backend` defaults to `parakeet`** rather than `nemotron`: Parakeet v3 is
-   the smaller download and is not under the NVIDIA OpenMDW licence. Switch to
-   whichever backend wins the `--bench-live` comparison.
+7. **`asr.backend` defaults to `whisper`** in config.yaml: the large-v3-turbo CTranslate2
+   build is the fastest CPU path that still sounds good for command recognition.
 
 ## 8. Troubleshooting
 

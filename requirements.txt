@@ -21,6 +21,7 @@ yt-dlp>=2024.8.6
 
 # --- ASR backends ---
 faster-whisper>=1.0.3          # backend: whisper (CTranslate2)
+vosk>=0.3.45                # backend: vosk (small en + pt offline models)
 onnx-asr>=0.10                 # backend: parakeet (parakeet-tdt-0.6b-v3)
 onnxruntime-gpu<1.27           # CUDAExecutionProvider, also used by the VAD + nemotron
 # faster-whisper's ffmpeg is bundled through PyAV, no system ffmpeg needed for decoding.

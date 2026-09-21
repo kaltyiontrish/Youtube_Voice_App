@@ -68,6 +68,13 @@ class LoadingTests(unittest.TestCase):
         self.assertEqual(config.asr.whisper.beam_size, 1)
         self.assertFalse(config.asr.whisper.condition_on_previous_text)
 
+    def test_vosk_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(write_config(Path(temp), MINIMAL))
+        self.assertEqual(config.asr.vosk_model_en, "vosk-model-small-en-us-0.15")
+        self.assertEqual(config.asr.vosk_model_pt, "vosk-model-small-pt-0.3")
+        self.assertIsNone(config.asr.vosk_grammar)
+
     def test_verbs_are_lowercased(self) -> None:
         payload = dict(MINIMAL)
         payload["commands"] = [{"action": "stop", "verbs": ["PARA"], "takes_query": False}]
@@ -79,13 +86,22 @@ class LoadingTests(unittest.TestCase):
         """The documented default must always load."""
         repo_root = Path(__file__).resolve().parent.parent
         config = load_config(repo_root / "config.yaml")
-        self.assertIn(config.asr.backend, ("whisper", "parakeet", "nemotron"))
+        self.assertIn(config.asr.backend, ("whisper", "parakeet", "nemotron", "vosk"))
 
 
 class ValidationTests(unittest.TestCase):
     def load_with(self, payload: dict) -> Config:
         with tempfile.TemporaryDirectory() as temp:
             return load_config(write_config(Path(temp), payload))
+
+    def test_vosk_grammar_must_be_strings_or_null(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(
+                write_config(Path(temp), {"asr": {"vosk": {"grammar": ["youtube play"]}}})
+            )
+        self.assertEqual(config.asr.vosk_grammar, ("youtube play",))
+        with self.assertRaises(ConfigError):
+            self.load_with({"asr": {"vosk": {"grammar": ["ok", 42]}}})
 
     def test_unknown_backend_is_rejected(self) -> None:
         with self.assertRaises(ConfigError):

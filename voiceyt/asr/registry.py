@@ -12,12 +12,14 @@ from ..config import Config, ConfigError
 from .base import ASRBackend, AsrError, BaseBackend
 from .nemotron import NemotronBackend
 from .parakeet import ParakeetBackend
+from .vosk import VoskBackend
 from .whisper import WhisperBackend
 
 BACKENDS: dict[str, type[BaseBackend]] = {
     WhisperBackend.name: WhisperBackend,
     ParakeetBackend.name: ParakeetBackend,
     NemotronBackend.name: NemotronBackend,
+    VoskBackend.name: VoskBackend,
 }
 
 

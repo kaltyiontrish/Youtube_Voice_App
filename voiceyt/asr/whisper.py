@@ -23,6 +23,26 @@ REPO_TEMPLATE = "Systran/faster-whisper-{model}"
 DISK_MODEL_FILE = "model.bin"
 
 
+def _repo_id_for(model: str) -> str:
+    """Resolve the HuggingFace repo for a faster-whisper model name.
+
+    Most sizes live under ``Systran/``, but a few (large-v3-turbo, turbo,
+    distil-*) are published by other orgs.  faster-whisper ships the
+    authoritative map in ``faster_whisper.utils._MODELS``; use it when
+    available and fall back to the Systran template otherwise.
+    """
+    name = Path(model).name
+    try:
+        from faster_whisper.utils import _MODELS
+
+        repo = _MODELS.get(name)
+        if repo:
+            return repo
+    except Exception:
+        pass
+    return REPO_TEMPLATE.format(model=name)
+
+
 class WhisperBackend(BaseBackend):
     """CTranslate2 build of Whisper, running per VAD utterance."""
 
@@ -51,7 +71,7 @@ class WhisperBackend(BaseBackend):
         model = config.asr.whisper.model
         target = self.local_dir(config)
         target.mkdir(parents=True, exist_ok=True)
-        repo_id = REPO_TEMPLATE.format(model=Path(model).name)
+        repo_id = _repo_id_for(model)
         LOGGER.info("downloading whisper %s -> %s", repo_id, target)
         try:
             snapshot_download(repo_id=repo_id, local_dir=str(target))
