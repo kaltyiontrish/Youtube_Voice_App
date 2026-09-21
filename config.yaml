@@ -17,15 +17,15 @@ aec:
   stream_delay_ms: 0      # extra alignment offset applied to the reference
 
 asr:
-  backend: whisper        # whisper | parakeet | nemotron (set from --bench results)
+  backend: whisper          # whisper | parakeet | nemotron | vosk (set from --bench results)
   models_dir: ./models
-  device: cpu             # cuda | cpu (cpu: onnx CUDA provider unavailable here)
+  device: cuda             # cuda | cpu (cuda: use RTX 2060 for faster-whisper CTranslate2)
   language: en            # pinned: whisper can only answer in this language;
                           # parakeet auto-detects per utterance and drifts to
                           # russian on short clips (proven 2026-09-20)
   whisper:
-    model: small          # any faster-whisper size or a local directory name
-    compute_type: int8    # int8 = fastest on cpu
+    model: large-v3-turbo  # any faster-whisper size or a local directory name
+    compute_type: float16    # float16 = fastest on CUDA RTX 2060; auto-downgrades to int8 on CPU
     beam_size: 1          # greedy keeps latency down (faster-whisper default: 5)
     condition_on_previous_text: false
   parakeet:
@@ -36,6 +36,10 @@ asr:
     chunk_ms: 320         # 80/160/320/560/1120 supported by the export tooling
     precision: fp16       # fp16 | fp32 | int8
     language: auto        # auto emits <xx-XX> tags; pt-PT is also available
+  vosk:
+    model_en: vosk-model-small-en-us-0.15
+    model_pt: vosk-model-small-pt-0.3
+    grammar: null               # null = free-form; list = constrain to those phrases
 
 vad:
   enabled: true
@@ -60,6 +64,7 @@ player:
   volume_max: 130
   start_timeout_s: 10
   extra_args: ["--no-video", "--really-quiet", "--idle=yes"]
+  playlist_path: null     # path to JSON playlist file; null = disabled
 
 search:
   results: 5              # size of the "proximo" pool
@@ -83,3 +88,13 @@ commands:
   - {action: resume,      verbs: [continue, continua, retoma],               takes_query: false}
   - {action: volume_up,   verbs: [louder, "mais alto", aumenta, "sobe o som"], takes_query: false}
   - {action: volume_down, verbs: [quieter, "mais baixo", baixa, "baixa o som"], takes_query: false}
+
+ui:
+  overlay_width: 960              # window width in pixels (960-1920)
+  overlay_height: 540             # window height in pixels (540-1080)
+  always_on_top: true             # keep window above others
+  show_playlist: true             # show saved playlist in overlay
+  fade_after_s: 30                # quiet time before overlay dims
+  hide_after_s: 120               # quiet time before overlay hides
+  hide_while_playing: false       # auto-hide overlay when music plays
+  mode: compact                   # compact | expanded

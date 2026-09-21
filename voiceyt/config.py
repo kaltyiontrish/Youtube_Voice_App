@@ -45,6 +45,11 @@ DEFAULTS: dict[str, Any] = {
             "condition_on_previous_text": False,
         },
         "parakeet": {"model_id": "nemo-parakeet-tdt-0.6b-v3", "quantization": None},
+        "vosk": {
+            "model_en": "vosk-model-small-en-us-0.15",
+            "model_pt": "vosk-model-small-pt-0.3",
+            "grammar": None,
+        },
         "nemotron": {
             "model_id": "codavidgarcia/nemotron-3.5-asr-streaming-0.6b-onnx",
             "chunk_ms": 320,
@@ -75,6 +80,7 @@ DEFAULTS: dict[str, Any] = {
         "volume_max": 130,
         "start_timeout_s": 10,
         "extra_args": ["--no-video", "--really-quiet", "--idle=yes"],
+        "playlist_path": None,
     },
     "search": {"results": 5, "cookies_from_browser": None, "socket_timeout_s": 15},
     "behaviour": {
@@ -94,6 +100,16 @@ DEFAULTS: dict[str, Any] = {
         {"action": "volume_up", "verbs": ["mais alto", "aumenta", "sobe o som"], "takes_query": False},
         {"action": "volume_down", "verbs": ["mais baixo", "baixa", "baixa o som"], "takes_query": False},
     ],
+    "ui": {
+        "overlay_width": 960,
+        "overlay_height": 540,
+        "always_on_top": True,
+        "show_playlist": True,
+        "fade_after_s": 30,
+        "hide_after_s": 120,
+        "hide_while_playing": False,
+        "mode": "compact",
+    },
 }
 
 
@@ -148,6 +164,9 @@ class AsrConfig:
     whisper: WhisperConfig
     parakeet: ParakeetConfig
     nemotron: NemotronConfig
+    vosk_model_en: str
+    vosk_model_pt: str
+    vosk_grammar: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -231,7 +250,7 @@ class Config:
 # loading helpers
 # --------------------------------------------------------------------------- #
 
-ASR_BACKENDS = ("whisper", "parakeet", "nemotron")
+ASR_BACKENDS = ("whisper", "parakeet", "nemotron", "vosk")
 NEMOTRON_CHUNK_MS = (80, 160, 320, 560, 1120)
 REQUIRED_SAMPLE_RATE = 16000
 
@@ -271,6 +290,21 @@ def _float(section: dict[str, Any], name: str, where: str) -> float:
         raise ConfigError(f"{where}.{name} must be a number, got {value!r}")
     return float(value)
 
+
+
+def _str_list_or_none(section: dict[str, Any], key: str, where: str) -> tuple | None:
+    """Optional string list: null stays null, otherwise validated like commands."""
+    value = section.get(key, None)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{where}.{key} must be null or a non-empty list of strings")
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{where}.{key} may only contain non-empty strings")
+        cleaned.append(item.strip())
+    return tuple(cleaned)
 
 def _bool(section: dict[str, Any], name: str, where: str) -> bool:
     value = section.get(name)
@@ -380,6 +414,7 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
     whisper_raw = _section(asr_raw, "whisper")
     parakeet_raw = _section(asr_raw, "parakeet")
     nemotron_raw = _section(asr_raw, "nemotron")
+    vosk_raw = _section(asr_raw, "vosk")
 
     nemotron_chunk_ms = _int(nemotron_raw, "chunk_ms", "asr.nemotron", minimum=1)
     if nemotron_chunk_ms not in NEMOTRON_CHUNK_MS:
@@ -399,6 +434,9 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         models_dir=Path(_str(asr_raw, "models_dir", "asr")),
         device=device,
         language=_str(asr_raw, "language", "asr").lower(),
+        vosk_model_en=_str(vosk_raw, "model_en", "asr.vosk"),
+        vosk_model_pt=_str(vosk_raw, "model_pt", "asr.vosk"),
+        vosk_grammar=_str_list_or_none(vosk_raw, "grammar", "asr.vosk"),
         whisper=WhisperConfig(
             model=_str(whisper_raw, "model", "asr.whisper"),
             compute_type=_str(whisper_raw, "compute_type", "asr.whisper"),
