@@ -334,14 +334,23 @@ class AudioCapture:
         if status:
             self._status = str(status)
         block = np.array(indata[:, 0], dtype=np.float32, copy=True)
-        self._ring.write(block)
         self._level = float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
-        if self._closed.is_set():
-            return
-        try:
-            self._queue.put_nowait(block)
-        except Full:
-            self._dropped += 1
+        # A stream opened at the device's native rate (see :meth:`open`) hands
+        # us 44.1/48 kHz frames; without this the pipeline would hear them as
+        # 16 kHz - three times too fast - and see 1536-frame blocks.
+        chunks = (
+            [block]
+            if self._device_rate == self.sample_rate
+            else self._downsample(block)
+        )
+        for chunk in chunks:
+            self._ring.write(chunk)
+            if self._closed.is_set():
+                return
+            try:
+                self._queue.put_nowait(chunk)
+            except Full:
+                self._dropped += 1
 
     # -- consumption ----------------------------------------------------- #
 
