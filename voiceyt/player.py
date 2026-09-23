@@ -498,9 +498,10 @@ class MpvPlayer:
     def unpause(self) -> bool:
         """Resume after pause/stop: unpause, else replay current playlist entry.
 
-        mpv's ``stop`` clears the playlist (playlist-pos becomes -1), so a
-        plain ``set pause=no`` does nothing - in that case replay the current
-        index, which keeps the file mpv just stopped on.
+        ``stop`` is pause-style now, so the first branch is the live one; the
+        replay fallback stays for playlists that were cleared some other way
+        (old sessions, external mpv control), which keeps the file mpv just
+        stopped on.
         """
         self.command("set_property", "pause", False, raise_on_error=False)
         try:
@@ -528,9 +529,19 @@ class MpvPlayer:
         return True
 
     def stop(self) -> bool:
-        self.command("stop", raise_on_error=False)
+        """Pause-style stop so ``resume`` always has something to resume.
+
+        mpv's ``stop`` clears the playlist (``playlist-pos`` becomes -1), so
+        the old resume-after-stop path had to guess the track back.  Pausing
+        keeps the entry loaded; ``unpause`` then just flips ``pause`` off.
+        """
+        self.command("set_property", "pause", True, raise_on_error=False)
         self._playing = False
         return True
+
+    def pause(self) -> bool:
+        """Alias of :meth:`stop` for the voice/command layer."""
+        return self.stop()
 
     def volume(self) -> float:
         value = self.command("get_property", "volume", timeout=3.0)

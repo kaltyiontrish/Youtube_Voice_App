@@ -24,7 +24,7 @@ import yaml
 from voiceyt.__main__ import _ui_jump_to_pool, _ui_log_pause, _ui_quit, _ui_switch_mic
 from voiceyt.__main__ import Listener
 from voiceyt.config import UiConfig, load_config
-from voiceyt.ui import Overlay, Tray, UiState, _truncate, _window_size
+from voiceyt.ui import Overlay, Tray, UiState, _player_transport, _truncate, _window_size
 from voiceyt.ui import RECENT_MAX
 
 CONFIG = {
@@ -208,12 +208,30 @@ class FakePlayer:
     def __init__(self, titles: list[str]) -> None:
         self.titles = list(titles)
         self.jumped: list[int] = []
+        self.commands: list[tuple] = []  # every mpv-level call, in order
+        self.paused = False              # mirrors mpv's pause property
+        self.playing = False             # mirrors MpvPlayer._playing
 
     def pool_titles(self) -> list[str]:
         return list(self.titles)
 
     def jump_to(self, index: int) -> bool:
         self.jumped.append(index)
+        self.playing = True
+        return True
+
+    def command(self, *args) -> None:
+        self.commands.append(tuple(args))
+
+    def stop(self) -> bool:
+        self.command("set_property", "pause", True)
+        self.playing = False
+        return True
+
+    def unpause(self) -> bool:
+        self.paused = False
+        self.command("set_property", "pause", False)
+        self.playing = True
         return True
 
 
@@ -248,6 +266,20 @@ class UiCallbackTests(unittest.TestCase):
         _ui_jump_to_pool(self.player, self.ui, 2)
         self.assertEqual(self.player.jumped, [2])
         self.assertIn("jump #3", self.ui.snapshot()["action"])
+
+    def test_transport_stop_then_resume_keeps_the_track(self) -> None:
+        """stop is pause-style now, so resume always has something to resume."""
+        _player_transport(self.player, self.ui, "stop")
+        self.assertIn(("set_property", "pause", True), self.player.commands)
+        self.assertFalse(self.player.playing)
+        _player_transport(self.player, self.ui, "resume")
+        self.assertIn(("set_property", "pause", False), self.player.commands)
+        self.assertTrue(self.player.playing)
+
+    def test_stop_never_issues_a_hard_mpv_stop(self) -> None:
+        _player_transport(self.player, self.ui, "stop")
+        bare_stops = [args for args in self.player.commands if args == ("stop",)]
+        self.assertEqual(bare_stops, [])
 
     def test_pool_click_out_of_range_does_nothing(self) -> None:
         _ui_jump_to_pool(self.player, self.ui, 5)
