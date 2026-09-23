@@ -172,5 +172,113 @@ class ValidationTests(unittest.TestCase):
         validate_actions(load_config(repo_root / "config.yaml"))
 
 
+class UiConfigTests(unittest.TestCase):
+    """A1 of UI_Design.MD: the whole ui: block parses and validates."""
+
+    def load_with(self, payload: dict) -> Config:
+        with tempfile.TemporaryDirectory() as temp:
+            return load_config(write_config(Path(temp), payload))
+
+    def ui_overrides(self, **overrides) -> dict:
+        base = {
+            "overlay_width": 1280,
+            "overlay_height": 720,
+            "always_on_top": False,
+            "show_playlist": False,
+            "fade_after_s": 5.0,
+            "hide_after_s": 60.0,
+            "hide_while_playing": True,
+            "mode": "expanded",
+        }
+        base.update(overrides)
+        return {**MINIMAL, "ui": base}
+
+    def test_defaults_load(self) -> None:
+        ui = self.load_with(MINIMAL).ui_config
+        self.assertIsNotNone(ui)
+        self.assertEqual(ui.overlay_width, 960)
+        self.assertEqual(ui.overlay_height, 540)
+        self.assertTrue(ui.always_on_top)
+        self.assertTrue(ui.show_playlist)
+        self.assertEqual(ui.fade_after_s, 30.0)
+        self.assertEqual(ui.hide_after_s, 120.0)
+        self.assertFalse(ui.hide_while_playing)
+        self.assertEqual(ui.mode, "compact")
+
+    def test_every_key_round_trips(self) -> None:
+        ui = self.load_with(self.ui_overrides()).ui_config
+        self.assertEqual(ui.overlay_width, 1280)
+        self.assertEqual(ui.overlay_height, 720)
+        self.assertFalse(ui.always_on_top)
+        self.assertFalse(ui.show_playlist)
+        self.assertEqual(ui.fade_after_s, 5.0)
+        self.assertEqual(ui.hide_after_s, 60.0)
+        self.assertTrue(ui.hide_while_playing)
+        self.assertEqual(ui.mode, "expanded")
+
+    def test_bad_width_is_rejected_naming_the_key(self) -> None:
+        for bad in (500, 5000, "wide", True, 960.5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError) as caught:
+                    self.load_with(self.ui_overrides(overlay_width=bad))
+                self.assertIn("ui.overlay_width", str(caught.exception))
+
+    def test_bad_height_is_rejected_naming_the_key(self) -> None:
+        for bad in (200, 5000, "tall", False):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ConfigError) as caught:
+                    self.load_with(self.ui_overrides(overlay_height=bad))
+                self.assertIn("ui.overlay_height", str(caught.exception))
+
+    def test_bad_mode_is_rejected_naming_the_key(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with(self.ui_overrides(mode="huge"))
+        self.assertIn("ui.mode", str(caught.exception))
+
+    def test_bad_bool_is_rejected_naming_the_key(self) -> None:
+        for key in ("always_on_top", "show_playlist", "hide_while_playing"):
+            with self.subTest(key=key):
+                with self.assertRaises(ConfigError) as caught:
+                    self.load_with(self.ui_overrides(**{key: "yes"}))
+                self.assertIn(f"ui.{key}", str(caught.exception))
+
+    def test_negative_timers_are_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with(self.ui_overrides(fade_after_s=-1))
+        self.assertIn("ui.fade_after_s", str(caught.exception))
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with(self.ui_overrides(hide_after_s=-1.5))
+        self.assertIn("ui.hide_after_s", str(caught.exception))
+
+    def test_bad_timer_type_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with(self.ui_overrides(fade_after_s="soon"))
+        self.assertIn("ui.fade_after_s", str(caught.exception))
+
+
+class PlaylistPathTests(unittest.TestCase):
+    """A2 of UI_Design.MD: player.playlist_path parses and resolves."""
+
+    def test_null_is_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = load_config(write_config(Path(temp), MINIMAL))
+        self.assertIsNone(config.player.playlist_path)
+
+    def test_relative_path_resolves_against_the_config_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            config = load_config(
+                write_config(directory, {**MINIMAL, "player": {"playlist_path": "./lists/p.json"}})
+            )
+        self.assertTrue(config.player.playlist_path.is_absolute())
+        self.assertEqual(config.player.playlist_path, (directory / "lists/p.json").resolve())
+
+    def test_bad_type_is_rejected_naming_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ConfigError) as caught:
+                load_config(write_config(Path(temp), {**MINIMAL, "player": {"playlist_path": 42}}))
+        self.assertIn("player.playlist_path", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

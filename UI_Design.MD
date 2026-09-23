@@ -45,89 +45,89 @@ Reuse everything below — the ladder says it already exists:
 
 ### A. Groundwork — wire the config that already exists (do first)
 
-- [ ] A1 `UiConfig` dataclass + `_build()` parsing/validation for the whole `ui:`
+- [x] A1 `UiConfig` dataclass + `_build()` parsing/validation for the whole `ui:`
   block; defaults stay exactly as in `config.yaml`. Files: `voiceyt/config.py`,
   `tests/test_config.py` (one case per key incl. bad width/mode rejected).
-- [ ] A2 `PlayerConfig.playlist_path: Path | None` + resolve relative to the config
+- [x] A2 `PlayerConfig.playlist_path: Path | None` + resolve relative to the config
   dir (same `Config.resolve()` pattern as `log_path`); `null` = disabled.
   Files: `voiceyt/config.py`, `tests/test_config.py`.
-- [ ] A3 Replace hardcoded `WINDOW_WIDTH/WINDOW_HEIGHT/WINDOW_POS/FADE_AFTER_S/
+- [x] A3 Replace hardcoded `WINDOW_WIDTH/WINDOW_HEIGHT/WINDOW_POS/FADE_AFTER_S/
   HIDE_AFTER_S` in `voiceyt/ui.py` with the loaded `UiConfig` (keep the same
   constants as fallbacks only). `hide_while_playing` hides on `player.playing`.
   Files: `voiceyt/ui.py`, `tests/test_ui.py`.
 
 ### B. Music player tab (reuse `MpvPlayer` — no new player code)
 
-- [ ] B1 Header: status dot `UiState.snapshot()` + big heard line + live mic meter
+- [x] B1 Header: status dot `UiState.snapshot()` + big heard line + live mic meter
   (move current header widgets up, unchanged logic).
-- [ ] B2 Now-playing line: `player.current_title()` + `[pos/total]` +
+- [x] B2 Now-playing line: `player.current_title()` + `[pos/total]` +
   `vol %` (reuse `Overlay._now_playing()` verbatim).
-- [ ] B3 Transport buttons → existing methods only: Play/Pause toggles
+- [x] B3 Transport buttons → existing methods only: Play/Pause toggles
   `Tray.toggle_pause` semantics; Stop → `player.stop()`; Prev/Next →
   `player.prev_track()/next_track()`; Resume-after-stop keeps the documented
   replay-current-index behaviour (`player.py` "mpv's stop clears the playlist").
-- [ ] B4 Volume slider + mute → `set_volume()` (clamps 0–130 already inside);
+- [x] B4 Volume slider + mute → `set_volume()` (clamps 0–130 already inside);
   step buttons ±`volume_step`.
-- [ ] B5 Pool listbox: `pool_titles()` rows, click → `jump_to(index)` via the
+- [x] B5 Pool listbox: `pool_titles()` rows, click → `jump_to(index)` via the
   existing `_ui_jump_to_pool` bounds check (pool-changed-since-click = no-op).
-- [ ] B6 Status bar: mic name (`capture.device_name`), ASR backend, mpv alive,
+- [x] B6 Status bar: mic name (`capture.device_name`), ASR backend, mpv alive,
   AEC state. Poll in the existing 250 ms tick — **no new threads**.
-- [ ] B7 Accept: `behaviour.ui: false` runs 100% headless; every `test_ui.py`
+- [x] B7 Accept: `behaviour.ui: false` runs 100% headless; every `test_ui.py`
   test still passes; pool click out of range still a no-op.
 
 ### C. Playlists tab (the only new file in the project)
 
-- [ ] C1 NEW `voiceyt/playlists.py` (~80 lines, stdlib `json` only): JSON file at
+- [x] C1 NEW `voiceyt/playlists.py` (~80 lines, stdlib `json` only): JSON file at
   `player.playlist_path` = `{"playlists": {"name": [{"title":…, "url":…}]}}`;
   `load/save/create/rename/delete/add/remove/reorder`; atomic save
   (write-temp-then-replace); corrupt file → back up to `*.bak` and start empty,
   never crash the daemon. Reuse `path.read_text/write_text` idiom from probes.
-- [ ] C2 Tab UI: playlist dropdown + track list (double-click →
+- [x] C2 Tab UI: playlist dropdown + track list (double-click →
   `player.load(url, "replace")`); Add-current (uses `current_title()` +
   mpv `path` property); New/Rename/Delete; drag- or button-reorder.
-- [ ] C3 Voice hooks: zero daemon changes — `play` results remain the live pool;
+- [x] C3 Voice hooks: zero daemon changes — `play` results remain the live pool;
   saved playlists are UI-only until a later milestone wires new
   actions/verbs through `commands.py` + `validate_actions()`.
-- [ ] C4 Accept: restart restores playlists; corrupt JSON boots clean with a
+- [x] C4 Accept: restart restores playlists; corrupt JSON boots clean with a
   `*.bak` beside it; `playlist_path: null` hides the tab.
 
 ### D. Settings tab (edit `config.yaml`, incl. voice commands)
 
-- [ ] D1 Form bound to the live `Config` dataclasses: audio device (dropdown from
+- [x] D1 Form bound to the live `Config` dataclasses: audio device (dropdown from
   `list_mics()` + `--list-devices` indices), sample_rate display (fixed 16000 —
   show read-only; `_build()` rejects anything else), VAD threshold/silences,
   trigger words + windows, player volume min/max/step, search results/cookies,
   behaviour flags, all `ui:` keys incl. `mode: compact|expanded` (applies live,
   no restart; window resizes in place).
-- [ ] D2 Voice-command editor: table of the 7 actions (`play/next/prev/stop/
+- [x] D2 Voice-command editor: table of the 7 actions (`play/next/prev/stop/
   resume/volume_up/volume_down` + any future ones from `HANDLERS`) with editable
   verb lists and `takes_query` checkbox. Validate on save with the **existing**
   rules: unique actions, unique verbs (case-insensitive), non-empty,
   `takes_query` bool, every action in `HANDLERS` (`validate_actions()`), and
   every `HANDLERS` entry present (warn-only, same as today). Bad edit =
   inline error, file untouched.
-- [ ] D3 Save = `yaml.safe_dump` round-trip of only the edited sections
+- [x] D3 Save = `yaml.safe_dump` round-trip of only the edited sections
   (preserve comments elsewhere is out of scope — say so in the tab); **changing
   commands requires daemon restart** (matcher is built once in `run_daemon`):
   show "restart to apply voice-command changes" banner. Other tabs keep working
   until restart.
-- [ ] D4 "Copy diagnostics" button: device list + backend + last error onto the
+- [x] D4 "Copy diagnostics" button: device list + backend + last error onto the
   clipboard (kills the back-and-forth of past mic-bug sessions).
-- [ ] D5 Accept: saving invalid verbs is refused with the message; restart
+- [x] D5 Accept: saving invalid verbs is refused with the message; restart
   applies them (`--replay-log` proves they fire); nothing else in the file is
   lost.
 
 ### E. Anything-that-fits (small, each optional, each one task)
 
-- [ ] E1 Recent/history strip: last 10 `play` queries from `CommandRunner`
+- [x] E1 Recent/history strip: last 10 `play` queries from `CommandRunner`
   (`last_query/last_results` already stored) — click to replay.
-- [ ] E2 Search box in Player tab: type query → `searcher.search()` →
+- [x] E2 Search box in Player tab: type query → `searcher.search()` →
   `play_results()` (same path as the voice `play` handler; voice stays primary).
-- [ ] E3 Backend picker: `--backend`-equivalent dropdown (whisper/parakeet/
+- [x] E3 Backend picker: `--backend`-equivalent dropdown (whisper/parakeet/
   nemotron/vosk) — applies on restart, same rule as D3.
-- [ ] E4 Desktop shortcut + autostart toggle in Settings (reuse
+- [x] E4 Desktop shortcut + autostart toggle in Settings (reuse
   `create_shortcut.ps1`; document the Startup-folder step in-app).
-- [ ] E5 `?` overlay: trigger word + all verbs cheat-sheet, generated from the
+- [x] E5 `?` overlay: trigger word + all verbs cheat-sheet, generated from the
   live `Config` so it never goes stale.
 
 ## 3. Suggestions (my take, in build order)

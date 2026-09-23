@@ -17,5 +17,9 @@ captures/
 # Local overrides
 config.local.yaml
 
+# Playlists are user data (path is configurable via player.playlist_path)
+playlists.json
+playlists.json.bak
+
 # portable mpv build (downloaded separately, too big for git)
 tools/

@@ -197,6 +197,7 @@ class PlayerConfig:
     volume_max: int
     start_timeout_s: float
     extra_args: tuple[str, ...]
+    playlist_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,18 @@ class BehaviourConfig:
     ignore_trigger_ms_after_play: int
     require_same_utterance_while_playing: bool
     ui: bool
+
+
+@dataclass(frozen=True)
+class UiConfig:
+    overlay_width: int
+    overlay_height: int
+    always_on_top: bool
+    show_playlist: bool
+    fade_after_s: float
+    hide_after_s: float
+    hide_while_playing: bool
+    mode: str
 
 
 @dataclass(frozen=True)
@@ -236,6 +249,7 @@ class Config:
     player: PlayerConfig
     search: SearchConfig
     behaviour: BehaviourConfig
+    ui_config: UiConfig | None = None
     commands: tuple[CommandSpec, ...] = field(default_factory=tuple)
 
     def resolve(self, value: str | Path) -> Path:
@@ -490,6 +504,7 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
     extra_args = player_raw.get("extra_args") or []
     if not isinstance(extra_args, list) or any(not isinstance(arg, str) for arg in extra_args):
         raise ConfigError("player.extra_args must be a list of strings")
+    playlist_path = _optional_str(player_raw, "playlist_path", "player")
     player = PlayerConfig(
         mpv_path=_str(player_raw, "mpv_path", "player"),
         ipc_path=_optional_str(player_raw, "ipc_path", "player"),
@@ -499,6 +514,7 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         volume_max=volume_max,
         start_timeout_s=_float(player_raw, "start_timeout_s", "player"),
         extra_args=tuple(extra_args),
+        playlist_path=Path(playlist_path) if playlist_path else None,
     )
 
     search_raw = _section(raw, "search")
@@ -567,6 +583,35 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
             CommandSpec(action=action, verbs=tuple(clean_verbs), takes_query=takes_query)
         )
 
+    # ---- UI config validation --------------------------------------------------
+    ui_config: UiConfig | None = None
+    ui_raw = _section(raw, "ui")
+    overlay_width = _int(ui_raw, "overlay_width", "ui", minimum=960)
+    if overlay_width > 1920:
+        raise ConfigError(f"ui.overlay_width must be <= 1920, got {overlay_width}")
+    overlay_height = _int(ui_raw, "overlay_height", "ui", minimum=540)
+    if overlay_height > 1080:
+        raise ConfigError(f"ui.overlay_height must be <= 1080, got {overlay_height}")
+    fade_after_s = _float(ui_raw, "fade_after_s", "ui")
+    if fade_after_s < 0:
+        raise ConfigError(f"ui.fade_after_s must be >= 0, got {fade_after_s}")
+    hide_after_s = _float(ui_raw, "hide_after_s", "ui")
+    if hide_after_s < 0:
+        raise ConfigError(f"ui.hide_after_s must be >= 0, got {hide_after_s}")
+    mode = _str(ui_raw, "mode", "ui").lower()
+    if mode not in ("compact", "expanded"):
+        raise ConfigError(f"ui.mode must be one of 'compact', 'expanded' (got {mode!r})")
+    ui_config = UiConfig(
+        overlay_width=overlay_width,
+        overlay_height=overlay_height,
+        always_on_top=_bool(ui_raw, "always_on_top", "ui"),
+        show_playlist=_bool(ui_raw, "show_playlist", "ui"),
+        fade_after_s=fade_after_s,
+        hide_after_s=hide_after_s,
+        hide_while_playing=_bool(ui_raw, "hide_while_playing", "ui"),
+        mode=mode,
+    )
+
     config = Config(
         source=source,
         audio=audio,
@@ -577,6 +622,7 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         player=player,
         search=search,
         behaviour=behaviour,
+        ui_config=ui_config,
         commands=tuple(commands),
     )
     return _resolve_paths(config)
@@ -589,7 +635,43 @@ def _resolve_paths(config: Config) -> Config:
     asr = replace(config.asr, models_dir=config.resolve(config.asr.models_dir))
     vad = replace(config.vad, model_path=config.resolve(config.vad.model_path))
     behaviour = replace(config.behaviour, log_path=config.resolve(config.behaviour.log_path))
-    return replace(config, asr=asr, vad=vad, behaviour=behaviour)
+    player = config.player
+    if player.playlist_path is not None:
+        player = replace(player, playlist_path=config.resolve(player.playlist_path))
+    return replace(config, player=player, asr=asr, vad=vad, behaviour=behaviour)
+
+
+def save_config_sections(path: str | Path, sections: dict[str, Any]) -> None:
+    """D3: merge *sections* (top-level keys) into the YAML file in place.
+
+    Only the given sections are replaced; every other key is written back as
+    loaded.  Comments are **not** preserved (``yaml.safe_dump`` limitation -
+    the settings tab says so).  Callers validate with ``load_config`` afterwards
+    and restore the original text on failure.
+    """
+    path = Path(path)
+    loaded: Any = {}
+    if path.is_file():
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            loaded = {}
+    if not isinstance(loaded, dict):
+        loaded = {}
+    for name, values in sections.items():
+        # Merge one level deep so a partial section (only the edited keys)
+        # never wipes its unchanged siblings; `commands` is a list and
+        # replaces wholesale, which is what the editor wants.
+        if isinstance(values, dict) and isinstance(loaded.get(name), dict):
+            merged = dict(loaded[name])
+            merged.update(values)
+            loaded[name] = merged
+        else:
+            loaded[name] = values
+    path.write_text(
+        yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
 
 def load_config(config_path: str | Path | None = None, backend: str | None = None) -> Config:

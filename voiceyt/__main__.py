@@ -21,6 +21,7 @@ import argparse
 import logging
 import math
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -622,6 +623,21 @@ def _ui_quit(listener) -> None:
     listener.stop()
 
 
+def _ui_play_query(runner, ui, query: str) -> None:
+    """Player-tab search box / recent-history click: the same path as a
+    spoken ``play`` (the runner's guard and handler do the rest)."""
+    from .matcher import Command
+
+    text = query.strip()
+    if not text:
+        return
+    LOGGER.info("play from the UI: %s", text)
+    ui.set_action(f"play {text}")
+    runner.dispatch(
+        Command(action="play", query=text, ts=time.monotonic(), text=text, reason="ui")
+    )
+
+
 
 def run_daemon(config: Config) -> int:
     """Default mode: listen, match and act (milestones M4, M5 and the UI)."""
@@ -658,8 +674,15 @@ def run_daemon(config: Config) -> int:
     log = TranscriptLog(config.behaviour.log_path, config.behaviour.log_transcripts).open()
 
     # ---- UI (overlay + tray): disabled by behaviour.ui = false ----------
-    ui = UiState(player=player) if config.behaviour.ui else None
+    ui = None
     tray = None
+    if config.behaviour.ui and config.ui_config:
+        ui = UiState(player=player)
+        try:
+            ui.set_volume(int(player.volume()))  # mpv may still be warming up
+        except Exception:
+            pass
+        ui.set_aec(f"AEC on ({config.aec.backend})" if config.aec.enabled else "")
 
     def dispatch(commands, ts: float) -> None:
         for command in commands:
@@ -668,6 +691,8 @@ def run_daemon(config: Config) -> int:
             )
             if ui is not None:
                 ui.set_action(f"{command.action} {command.query}".strip())
+                if command.action == "play" and command.query:
+                    ui.note_query(command.query)  # E1: recent-history strip
             runner.dispatch(command)
 
     def on_utterance(text: str, ts: float) -> None:
@@ -699,13 +724,18 @@ def run_daemon(config: Config) -> int:
 
     if ui is not None:
         ui.capture = listener.capture
+        ui.set_backend_name(backend.name)
+        ui.set_language(config.asr.language)
         tray = start_ui(
             ui,
+            config.ui_config,
             on_pool_click=lambda index: _ui_jump_to_pool(player, ui, index),
             on_pause=lambda: _ui_log_pause(ui, True),
             on_resume=lambda: _ui_log_pause(ui, False),
             on_mic_pick=lambda index: _ui_switch_mic(listener, ui, index),
             on_quit=lambda: _ui_quit(listener),
+            app_config=config,
+            on_play_query=lambda query: _ui_play_query(runner, ui, query),
         )
 
     example_trigger = config.trigger.words[0]

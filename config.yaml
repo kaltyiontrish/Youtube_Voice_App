@@ -64,7 +64,7 @@ player:
   volume_max: 130
   start_timeout_s: 10
   extra_args: ["--no-video", "--really-quiet", "--idle=yes"]
-  playlist_path: null     # path to JSON playlist file; null = disabled
+  playlist_path: ./playlists.json   # path to JSON playlist file; null = hides the tab
 
 search:
   results: 5              # size of the "proximo" pool
@@ -97,4 +97,4 @@ ui:
   fade_after_s: 30                # quiet time before overlay dims
   hide_after_s: 120               # quiet time before overlay hides
   hide_while_playing: false       # auto-hide overlay when music plays
-  mode: compact                   # compact | expanded
+  mode: expanded                  # compact | expanded (expanded = tabs + controls)
