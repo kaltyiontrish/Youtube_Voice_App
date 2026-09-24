@@ -83,7 +83,13 @@ DEFAULTS: dict[str, Any] = {
         "extra_args": ["--no-video", "--really-quiet", "--idle=yes"],
         "playlist_path": None,
     },
-    "search": {"results": 10, "cookies_from_browser": None, "socket_timeout_s": 15},
+    "search": {
+        "results": 10,
+        "browse_results": 10,
+        "voice_preview_results": 5,
+        "cookies_from_browser": None,
+        "socket_timeout_s": 15,
+    },
     "behaviour": {
         "log_transcripts": True,
         "log_path": "./logs/transcripts.log",
@@ -209,6 +215,8 @@ class PlayerConfig:
 @dataclass(frozen=True)
 class SearchConfig:
     results: int
+    browse_results: int
+    voice_preview_results: int
     cookies_from_browser: str | None
     socket_timeout_s: float
 
@@ -293,8 +301,8 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
-def _int(section: dict[str, Any], name: str, where: str, minimum: int | None = None) -> int:
-    value = section.get(name)
+def _int(section: dict[str, Any], name: str, where: str, minimum: int | None = None, default: int | None = None) -> int:
+    value = section.get(name, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"{where}.{name} must be a number, got {value!r}")
     if float(value) != int(value):
@@ -526,7 +534,11 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
 
     search_raw = _section(raw, "search")
     search = SearchConfig(
-        results=_int(search_raw, "results", "search", minimum=1),
+        results=_int(search_raw, "results", "search", minimum=1, default=10),
+        browse_results=_int(search_raw, "browse_results", "search", minimum=1, default=10),
+        voice_preview_results=_int(
+            search_raw, "voice_preview_results", "search", minimum=1, default=5
+        ),
         cookies_from_browser=_optional_str(search_raw, "cookies_from_browser", "search"),
         socket_timeout_s=_float(search_raw, "socket_timeout_s", "search"),
     )

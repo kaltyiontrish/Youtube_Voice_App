@@ -8,38 +8,35 @@
 
 Reuse everything below — the ladder says it already exists:
 
-- `voiceyt/ui.py` (734 lines): `UiState` mailbox (`set_heard/set_action/set_error/snapshot`,
-  `paused`/`shutdown` events), `Overlay(tk.Tk)` (250 ms poll, drag-vs-click guard,
-  status dot, mic meter, 5-row pool), `Tray` (raw-ctypes win32, pause/resume, mic
-  submenu, quit). Threading contract: **only the tkinter thread touches widgets**.
-- `voiceyt/player.py` `MpvPlayer`: `load/play_results/next_track/prev_track/jump_to/
-  stop/unpause/volume/set_volume/volume_delta/pool_titles/current_title/status`
-  (+ `playing` event-tracked, no IPC round trip).
-- `voiceyt/commands.py`: `HANDLERS` registry + `validate_actions()` (startup check).
-- `voiceyt/config.py`: `_deep_merge` defaults, frozen dataclasses, command rules
-  (unique actions; unique verbs case-insensitive; non-empty; `takes_query` bool).
-- `tests/test_ui.py`: unittest style with `FakePlayer/FakeCapture/FakeListener`.
-- Config keys waiting to be wired: `ui:` block (`overlay_width/height`,
-  `always_on_top`, `show_playlist`, `fade_after_s/hide_after_s`,
-  `hide_while_playing`, `mode`) and `player.playlist_path` — **both are parsed
-  nowhere today** (no `UiConfig` dataclass; `PlayerConfig` has no
-  `playlist_path` field). Groundwork tasks fix that first.
-- Constraints: stdlib `tkinter(+ttk)` + `ctypes` only, **no new dependency**;
-  Windows tray stays Windows-only; every headless mode (`--listen`, `--bench`,
-  `--replay-log`…) keeps working with `behaviour.ui: false`.
+- `voiceyt/cli_app.py`: parser, logging setup, configuration loading, and CLI mode dispatch.
+- `voiceyt/cli.py`: non-daemon commands (devices, models, benchmarks, meter, replay, AEC).
+- `voiceyt/daemon.py`: daemon composition, matcher wiring, UI callbacks, and runtime shutdown.
+- `voiceyt/listener.py`: audio → AEC → VAD → ASR callback pipeline.
+- `voiceyt/playback_service.py`: serialized playback coordination and shared snapshot boundary.
+- `voiceyt/runtime.py`: ordered resource registration and bounded cleanup.
+- `voiceyt/ui.py`: `UiState`, overlay, Settings, compact/expanded views, and tray integration.
+- `voiceyt/ui_theme.py`: five semantic color themes.
+- `voiceyt/player.py`: low-level persistent mpv JSON IPC adapter.
+- `voiceyt/search.py`: yt-dlp search/resolve adapter.
+- `voiceyt/playlists.py`: atomic local playlist storage.
+- `voiceyt/commands.py`: command registry and serialized intent dispatch.
+- `voiceyt/config.py`: defaults, validation, immutable runtime config, atomic save.
+- `tests/`: offline unit, contract, and UI compatibility tests.
+- Constraints: stdlib `tkinter(+ttk)` + `ctypes` only, no new dependency;
+  Windows tray stays Windows-only; headless modes remain functional with
+  `behaviour.ui: false`.
 
 ## 1. Window & space budget (the app must fit everything)
 
-- `compact` mode = today's 400x214 single panel (status + heard + meter + 5 pool rows).
-- `expanded` mode = minimum **960x540** from config (`overlay_width` 960–1920,
-  `overlay_height` 540–1080), frameless + draggable (keep current drag handlers),
-  `always_on_top` honoured, `ttk.Notebook` tabs on top (stdlib, no new dep).
-- Pixel budget at 960x540: header 56 (dot + heard + meter) · tab bar 34 ·
-  content 410 · status bar 28 (mic · backend · mpv · AEC) · padding 12 = **540**.
-- Player tab at 410 px: now-playing 70 · transport 56 · volume 40 · pool list
-  5×44 = 220 · gaps 24 = **410**. Pool grows by scrolling, not by growing the
-  window (`ponytail:` fixed 5-row viewport + scrollbar; virtualized list is the
-  upgrade path if pools ever exceed ~200 rows).
+- `compact` mode = a lightweight 400x214 voice/status overlay.
+- `expanded` mode = a modern shell with a dark sidebar (`Playlists`, `Settings`),
+  frameless top voice header, gain meter, one unified Music workspace, and a
+  persistent bottom player.
+- The three visible music surfaces are: Voice Search Results (top), Browse Music,
+  and Saved Playlist tracks. There is no separate Player page or hidden player list.
+- The persistent bottom bar owns transport, song position, and volume controls.
+- Browse and saved playlist lists scroll independently; playlist drag/drop is
+  persisted immediately. Double-click plays the selected result/track.
 
 ## 2. Tasks
 

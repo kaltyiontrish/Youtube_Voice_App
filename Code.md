@@ -43,6 +43,13 @@ Youtube_Voice_App/
 â”‚   â”œâ”€â”€ commands.py             Voice/UI command dispatch and handlers
 â”‚   â”œâ”€â”€ search.py               yt-dlp search and stream resolution
 â”‚   â”œâ”€â”€ player.py               Persistent mpv JSON IPC wrapper
+│   ├── playback_service.py       Serialized playback coordinator and snapshot
+│   ├── runtime.py                Ordered bounded resource cleanup
+│   ├── listener.py               Audio → AEC → VAD → ASR pipeline
+│   ├── daemon.py                 Live daemon composition and UI callbacks
+│   ├── cli.py                    Non-daemon CLI commands
+│   ├── cli_app.py                Parser, config loading, and CLI dispatch
+
 â”‚   â”œâ”€â”€ playlists.py            Atomic JSON playlist storage
 â”‚   â”œâ”€â”€ models.py               Explicit model download and verification
 â”‚   â”œâ”€â”€ transcripts.py          Journal writing, parsing, and replay
@@ -71,18 +78,16 @@ The normal entry point is:
 python -m voiceyt
 ```
 
-`voiceyt/__main__.py` owns:
+The normal entry point is a thin compatibility shim:
 
-- `build_parser()` for CLI arguments.
-- `main()` for configuration loading and mode selection.
-- `run_daemon()` for the live microphone/listener/player loop.
-- `cmd_list_devices()` for input-device discovery.
-- `cmd_meter()` for a live RMS meter.
-- `cmd_listen()` for transcript-only recording.
-- `cmd_download_models()` for explicit model installation.
-- `cmd_bench()` and `cmd_bench_live()` for ASR comparison.
-- `cmd_replay_log()` for offline matcher validation.
-- `cmd_aec_probe()` for echo-cancellation diagnostics.
+```text
+voiceyt/__main__.py -> voiceyt.cli_app.main()
+```
+
+`cli_app.py` owns parser construction, logging, configuration loading, CUDA DLL
+bootstrap, and mode dispatch. `cli.py` owns non-daemon commands. `daemon.py`
+owns live daemon composition and UI callbacks. `listener.py` owns the audio/VAD/
+ASR pipeline. `runtime.py` owns ordered resource cleanup.
 
 Useful commands:
 
@@ -328,8 +333,12 @@ Test areas include:
 - `test_search.py`: search query construction and result conversion;
 - `test_playlists.py`: JSON storage, corruption recovery, CRUD, ordering;
 - `test_replay.py`: transcript parsing and offline matcher replay;
-- `test_ui.py`: state mailbox, tray IDs, callbacks, list/player helpers;
-- `test_ui_theme.py`: five themes, semantic color keys, fallback;
+- `test_ui.py`: state mailbox, tray IDs, callbacks, three-list behavior, and player helpers;
+- `test_ui_theme.py`: five themes, semantic color keys, and fallback;
+- `test_runtime.py`: ordered idempotent cleanup;
+- `test_domain.py` / `test_protocols.py`: validated models and external seams;
+- `test_playback_service.py`: queue coordination and shared snapshots;
+- `test_commands.py`: serialized command dispatch and handlers;
 - `test_vosk.py`: model archive validation and extraction safety.
 
 Before committing a broad change, run:

@@ -1,4 +1,4 @@
-"""Command handlers (plan2.md §6.3 and §7).
+﻿"""Command handlers (plan2.md Â§6.3 and Â§7).
 
 Every ``action`` named in ``config.yaml`` must resolve to a handler registered
 here, and that is checked at startup - an unknown action is a configuration
@@ -15,6 +15,7 @@ from typing import Callable
 
 from .config import Config, ConfigError
 from .matcher import Command
+from .playback_service import PlaybackService
 from .player import MpvPlayer, PlayerError
 from .playlists import PlaylistStore
 from .search import SearchError, SearchResult, Searcher
@@ -64,6 +65,7 @@ class CommandRunner:
         self.config = config
         self.player = player
         self.searcher = searcher
+        self.playback = PlaybackService(player, searcher)
         self.last_play_started: float | None = None
         self.last_query: str = ""
         self.last_results: tuple[str, ...] = ()
@@ -77,7 +79,7 @@ class CommandRunner:
     # -- guards ---------------------------------------------------------- #
 
     def _within_play_guard(self, now: float) -> bool:
-        """plan2.md §8 step 3: ignore triggers right after playback starts."""
+        """plan2.md Â§8 step 3: ignore triggers right after playback starts."""
         if self.last_play_started is None:
             return False
         elapsed_ms = (now - self.last_play_started) * 1000.0
@@ -85,10 +87,7 @@ class CommandRunner:
 
     def _ensure_player(self) -> None:
         """Restart mpv if it died (socket loss, crash, user closed it)."""
-        if not self.player.alive:
-            LOGGER.warning("mpv is not running; restarting it")
-            self.player.close()
-            self.player.start()
+        self.playback.ensure_player()
 
     # -- dispatch -------------------------------------------------------- #
 
@@ -116,10 +115,7 @@ class CommandRunner:
     def play_playlist(self, results: list, start_index: int) -> bool:
         """Serialize saved-playlist replacement with voice and UI commands."""
         with self._dispatch_lock:
-            if not self.player.alive:
-                self.player.close()
-                self.player.start()
-            self.player.play_results(results, self.searcher, start_index=start_index)
+            self.playback.play_results(results, start_index)
             self.last_play_started = time.monotonic()
         return True
 
@@ -171,8 +167,7 @@ def _play_playlist_position(runner: CommandRunner, query: str) -> bool:
     if not 0 <= index < len(results):
         LOGGER.info("playlist position %s is out of range", query)
         return False
-    runner._ensure_player()
-    runner.player.play_results(results, runner.searcher, start_index=index)
+    runner.playback.play_results(results, index)
     runner.last_play_started = time.monotonic()
     return True
 
@@ -183,12 +178,10 @@ def _play(runner: CommandRunner, command: Command) -> bool:
     query = command.query.strip()
     if query.isdigit():
         return _play_playlist_position(runner, query)
-    runner._ensure_player()
-    results = runner.searcher.search(query)
+    results = runner.playback.search_and_play(query)
     if not results:
         LOGGER.warning("no results for %r", query)
         return False
-    runner.player.play_results(results, runner.searcher)
     runner.last_play_started = time.monotonic()
     runner.last_query = query
     runner.last_results = tuple(result.title for result in results)
@@ -211,8 +204,8 @@ def _jump(runner: CommandRunner, command: Command) -> bool:
 @handler("add")
 def _add(runner: CommandRunner, command: Command) -> bool:
     name = runner._playlist_name(command.query)
-    url = runner.player.current_url()
-    title = runner.player.current_title()
+    url = runner.playback.current_url()
+    title = runner.playback.current_title()
     if name is None or not url:
         return False
     runner.playlist_store.add(name, title or url, url)  # type: ignore[union-attr]
@@ -224,7 +217,7 @@ def _remove(runner: CommandRunner, command: Command) -> bool:
     name = runner._playlist_name(command.query)
     if name is None:
         return False
-    url = runner.player.current_url()
+    url = runner.playback.current_url()
     tracks = runner.playlist_store.tracks(name)  # type: ignore[union-attr]
     index = next((i for i, track in enumerate(tracks) if track.get("url") == url), -1)
     if index < 0:
@@ -236,37 +229,37 @@ def _remove(runner: CommandRunner, command: Command) -> bool:
 @handler("next")
 def _next(runner: CommandRunner, command: Command) -> bool:
     runner._ensure_player()
-    return runner.player.next_track()
+    return runner.playback.next_track()
 
 
 @handler("prev")
 def _prev(runner: CommandRunner, command: Command) -> bool:
     runner._ensure_player()
-    return runner.player.prev_track()
+    return runner.playback.prev_track()
 
 
 @handler("stop")
 def _stop(runner: CommandRunner, command: Command) -> bool:
-    return runner.player.stop()
+    return runner.playback.stop()
 
 
 @handler("pause")
 def _pause(runner: CommandRunner, command: Command) -> bool:
     runner._ensure_player()
-    return runner.player.pause()
+    return runner.playback.pause()
 
 
 @handler("resume")
 def _resume(runner: CommandRunner, command: Command) -> bool:
     runner._ensure_player()
-    return runner.player.unpause()
+    return runner.playback.unpause()
 
 
 @handler("volume_up")
 def _volume_up(runner: CommandRunner, command: Command) -> bool:
-    return runner.player.volume_delta(runner.config.player.volume_step)
+    return runner.playback.set_volume(runner.player.volume() + runner.config.player.volume_step)
 
 
 @handler("volume_down")
 def _volume_down(runner: CommandRunner, command: Command) -> bool:
-    return runner.player.volume_delta(-runner.config.player.volume_step)
+    return runner.playback.set_volume(runner.player.volume() - runner.config.player.volume_step)

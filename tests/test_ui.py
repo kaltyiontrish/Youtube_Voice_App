@@ -127,6 +127,13 @@ class TrayMenuIdTests(unittest.TestCase):
         self.assertEqual(snapshot["browse_query"], "query")
         self.assertEqual(snapshot["search_results"][0]["title"], "Browse")
 
+    def test_snapshot_exposes_playback_key(self) -> None:
+        state = UiState()
+        self.assertIsNone(state.snapshot()["playback"])
+        marker = object()
+        state.set_playback_snapshot(marker)
+        self.assertIs(state.snapshot()["playback"], marker)
+
     def test_snapshot_carries_browse_results(self) -> None:
         state = UiState()
         state.set_search_results([{"title": "Track", "url": "https://example.test/watch"}])

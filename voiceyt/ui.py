@@ -207,8 +207,10 @@ class UiState:
     or through the two :class:`threading.Event` flags.
     """
 
-    def __init__(self, player=None, capture=None, state_path: Path | None = None):
+    def __init__(self, player=None, capture=None, state_path: Path | None = None,
+                 playback=None, preview_max: int = POOL_ROWS):
         self.player = player        # MpvPlayer | None - polled for titles/volume
+        self.playback = playback    # PlaybackService | None - shared snapshot source
         self.capture = capture      # AudioCapture | None - marked in the mic menu
         self.state_path = state_path
         self._lock = threading.Lock()
@@ -230,6 +232,8 @@ class UiState:
         self._voice_preview_urls: list[str] = []
         self._last_browse_query = ""
         self._last_voice_query = ""
+        self._preview_max = max(1, int(preview_max))
+        self._playback_snapshot = None
         self._load_saved_state()
         self.paused = threading.Event()
         self.shutdown = threading.Event()
@@ -245,8 +249,8 @@ class UiState:
             self._search_results_ts = float(data.get("browse_results_ts", 0.0))
             self._last_browse_query = str(data.get("browse_query", ""))
             self._last_voice_query = str(data.get("voice_query", ""))
-            self._voice_previews = [str(item) for item in data.get("voice_previews", [])][:POOL_ROWS]
-            self._voice_preview_urls = [str(item) for item in data.get("voice_preview_urls", [])][:POOL_ROWS]
+            self._voice_previews = [str(item) for item in data.get("voice_previews", [])][:self._preview_max]
+            self._voice_preview_urls = [str(item) for item in data.get("voice_preview_urls", [])][:self._preview_max]
             if "volume" in data:
                 self._volume = max(0, min(100, int(data["volume"])))
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -296,6 +300,11 @@ class UiState:
         with self._lock:
             self._playing = playing
 
+    def set_playback_snapshot(self, snapshot) -> None:
+        """Cache the latest service-owned playback snapshot for UI consumers."""
+        with self._lock:
+            self._playback_snapshot = snapshot
+
     def set_aec(self, label: str) -> None:
         """B6: one-line AEC state shown in the expanded status bar."""
         with self._lock:
@@ -330,8 +339,8 @@ class UiState:
     def set_voice_previews(self, titles: list[str], urls: list[str] | None = None) -> None:
         """Show and persist the latest voice results and their canonical URLs."""
         with self._lock:
-            self._voice_previews = [str(title) for title in titles[:POOL_ROWS]]
-            self._voice_preview_urls = [str(url) for url in (urls or [])[:POOL_ROWS]]
+            self._voice_previews = [str(title) for title in titles[:self._preview_max]]
+            self._voice_preview_urls = [str(url) for url in (urls or [])[:self._preview_max]]
             self._save_state()
 
     def set_search_results(self, results: list[dict], query: str = "") -> None:
@@ -369,6 +378,7 @@ class UiState:
                 "search_results_ts": self._search_results_ts,
                 "browse_query": self._last_browse_query,
                 "voice_query": self._last_voice_query,
+                "playback": self._playback_snapshot,
             }
 
 
@@ -509,35 +519,45 @@ def _run_in_background(label: str, function, *args) -> None:
 
 
 def _player_transport(player, state: UiState, action: str) -> None:
-    """Transport buttons call mpv directly and toggle against live mpv state."""
-    if player is None:
+    """Transport buttons use the shared service when available, else the player."""
+    playback = getattr(state, "playback", None)
+    if player is None and playback is None:
         return
     try:
         if action == "play_pause":
-            # The event-tracked flag can lag immediately after seek. Query the
-            # player once here so one click always performs one transition.
-            if getattr(player, "is_playing", lambda: getattr(player, "playing", False))():
-                player.pause()
+            playing = (
+                playback.snapshot().state.value == "playing"
+                if playback is not None
+                else bool(getattr(player, "is_playing", lambda: getattr(player, "playing", False))())
+            )
+            if playing:
+                (playback.pause() if playback is not None else player.pause())
             else:
-                player.unpause()
+                (playback.unpause() if playback is not None else player.unpause())
         elif action == "pause":
-            player.pause()
+            playback.pause() if playback is not None else player.pause()
         elif action == "stop":
-            player.stop()
+            playback.stop() if playback is not None else player.stop()
         elif action == "prev":
-            player.prev_track()
+            playback.prev_track() if playback is not None else player.prev_track()
         elif action == "next":
-            player.next_track()
+            playback.next_track() if playback is not None else player.next_track()
         elif action == "resume":
-            player.unpause()
+            playback.unpause() if playback is not None else player.unpause()
     except Exception as exc:  # mpv may be restarting; report, don't crash
         LOGGER.warning("player %s failed: %s", action, exc)
         state.set_error(f"player: {exc}")
 
 
 def _player_toggle_mute(player, state: UiState, previous: float | None = None) -> None:
-    """Worker-safe mute toggle; Tk callers pass a plain previous value."""
-    current = player.volume()
+    """Worker-safe mute toggle; use service snapshot/volume when present."""
+    playback = getattr(state, "playback", None)
+    if playback is not None:
+        current = float(state.snapshot().get("volume", 50))
+    elif player is not None:
+        current = player.volume()
+    else:
+        return
     if current > 0:
         _player_set_volume(player, state, 0.0)
         state.set_action("muted")
@@ -547,12 +567,13 @@ def _player_toggle_mute(player, state: UiState, previous: float | None = None) -
 
 
 def _player_set_volume(player, state: UiState, raw_value) -> None:
-    """B4: volume slider release -> ``set_volume()`` (clamps inside)."""
-    if player is None:
+    """B4: commit volume through the service when present, with player fallback."""
+    playback = getattr(state, "playback", None)
+    if player is None and playback is None:
         return
     try:
-        applied = player.set_volume(float(raw_value))
-    except Exception as exc:  # mpv may be restarting; report, don't crash
+        applied = playback.set_volume(float(raw_value)) if playback is not None else player.set_volume(float(raw_value))
+    except Exception as exc:
         LOGGER.warning("player set_volume failed: %s", exc)
         state.set_error(f"player: {exc}")
         return
@@ -560,13 +581,14 @@ def _player_set_volume(player, state: UiState, raw_value) -> None:
 
 
 def _player_step_volume(player, state: UiState, delta: float) -> None:
-    """Send UI volume changes directly to mpv; voice dispatch is not involved."""
-    if player is None:
+    """Send UI volume changes directly to the service/mpv, never voice dispatch."""
+    playback = getattr(state, "playback", None)
+    if player is None and playback is None:
         return
     try:
         current = float(state.snapshot().get("volume", 50))
         target = max(0.0, min(130.0, current + float(delta)))
-        applied = player.set_volume(target)
+        applied = playback.set_volume(target) if playback is not None else player.set_volume(target)
         state.set_volume(int(round(applied)))
     except Exception as exc:
         LOGGER.warning("player volume step failed: %s", exc)
@@ -584,13 +606,11 @@ def _player_jump_to(player, state: UiState, index: int) -> bool:
     if player is None:
         return False
     try:
-        titles = player.pool_titles()
-    except Exception:  # mpv restarting: keep the click a silent no-op
-        return False
-    if index < 0 or index >= len(titles):
-        return False
-    try:
-        return bool(player.jump_to(index))
+        playback = getattr(state, "playback", None)
+        titles = player.pool_titles() if player is not None else []
+        if index < 0 or index >= len(titles):
+            return False
+        return bool(playback.jump_to(index) if playback is not None else player.jump_to(index))
     except Exception as exc:  # loud jump failure lands on the overlay
         LOGGER.warning("player jump_to(%d) failed: %s", index, exc)
         state.set_error(f"player: {exc}")
@@ -660,10 +680,8 @@ class Overlay(tk.Tk):
         self._fade_after_s = config.fade_after_s if config is not None else FADE_AFTER_S
         self._hide_after_s = config.hide_after_s if config is not None else HIDE_AFTER_S
         self._hide_while_playing = bool(config.hide_while_playing) if config is not None else False
-        self._player_box: tk.Widget | None = None   # B: player tab (expanded only)
-        self._player_list: tk.Listbox | None = None  # B5: scrolling pool rows
-        self._player_titles: list[str] = []
         self._voice_preview_list: tk.Listbox | None = None
+        self._preview_titles: list[str] = []
         self._voice_preview_scroll: ttk.Scrollbar | None = None
         self._vol_var = tk.DoubleVar(value=50.0)  # compatibility helper; no slider is shown
         self._vol_label: tk.StringVar | None = None  # volume readout is in the status line
@@ -792,6 +810,8 @@ class Overlay(tk.Tk):
         self._born = time.monotonic()
         self.geometry(f"{self._win_width}x{self._win_height}{WINDOW_POS}")
         self.show()
+        self.bind_all("<Control-Escape>", lambda _event: self._close_app())
+        self.bind_all("<Alt-F4>", lambda _event: self._close_app())
         self._drag_xy: tuple[int, int] | None = None
         self._drag_moved = False
         if self.expanded:
@@ -1053,66 +1073,6 @@ class Overlay(tk.Tk):
                   activebackground=ACCENT_DIM, relief="flat", bd=0,
                   command=self._on_mute_toggle).pack(side="left", padx=(4, 0))
 
-    def _build_player_tab(self, parent: tk.Widget) -> None:
-        """B2-B5: now-playing + transport + volume + pool list.
-
-        E2 adds a typed search box (the same ``play`` path a spoken query
-        takes), E1 the recent-query strip under it, E5 the ``?`` cheat-sheet.
-        """
-        # E2: typed query -> the same handler a spoken `play` uses.  Voice is
-        # still the primary input; this is only the second door to it.
-        search = tk.Frame(parent, bg=BG)
-        search.pack(fill="x", pady=(6, 2))
-        self._search_var = tk.StringVar(value="")
-        entry = tk.Entry(search, textvariable=self._search_var, bg=SURFACE_ALT,
-                         fg=FG, insertbackground=FG, relief="flat",
-                         highlightthickness=0, font=("Segoe UI", 10))
-        entry.pack(side="left", fill="x", expand=True, ipady=5)
-        entry.bind("<Return>", lambda _event: self._submit_search())
-        tk.Button(search, text="Search", width=9, bg=ACCENT, fg="#07130b",
-                  activebackground=ACCENT_DIM, activeforeground=FG,
-                  relief="flat", bd=0, command=self._submit_search).pack(
-                      side="left", padx=(8, 0), ipady=4)
-        tk.Button(search, text="?", width=3, bg=SURFACE, fg=FG_DIM,
-                  relief="flat", bd=0, command=self._show_cheatsheet).pack(
-                      side="left", padx=(6, 0), ipady=4)
-
-        # E1: newest-first strip of the last spoken play queries (filled by
-        # _refresh_recent on the poll tick, never rebuilt unless it changed).
-        self._recent_box = tk.Frame(parent, bg=BG)
-        self._recent_box.pack(fill="x", pady=(0, 2))
-
-        self._now_var = tk.StringVar(value="Nothing playing")
-        tk.Label(parent, textvariable=self._now_var, bg=SURFACE, fg=FG,
-                 anchor="w", font=("Segoe UI", 16, "bold"), padx=14,
-                 pady=10).pack(fill="x", pady=(8, 4))
-        seek = tk.Frame(parent, bg=BG, padx=14)
-        seek.pack(fill="x", pady=(0, 6))
-        self._seek_label = tk.StringVar(value="0:00 / --:--")
-        tk.Label(seek, textvariable=self._seek_label, bg=BG, fg=FG_DIM,
-                 width=13, font=("Segoe UI", 8)).pack(side="left")
-        self._seek_var = tk.DoubleVar(value=0.0)
-        scale = ttk.Scale(seek, from_=0, to=100, variable=self._seek_var,
-                          style="Modern.Horizontal.TScale")
-        scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        scale.bind("<ButtonPress-1>", self._on_seek_press)
-        scale.bind("<B1-Motion>", self._on_seek_motion)
-        scale.bind("<ButtonRelease-1>", self._on_seek_release)
-        # B5: listbox with scrollbar; click = jump via the same bounds check.
-        box = tk.Frame(parent, bg=BG)
-        box.pack(fill="both", expand=True)
-        scroll = tk.Scrollbar(box, orient="vertical")
-        self._player_list = tk.Listbox(box, bg=SURFACE, fg=FG, bd=0,
-                                       highlightthickness=0, height=7,
-                                       yscrollcommand=scroll.set,
-                                       selectbackground=ACCENT_DIM,
-                                       selectforeground=FG,
-                                       font=("Segoe UI", 10), activestyle="none")
-        scroll.config(command=self._player_list.yview)
-        scroll.pack(side="right", fill="y")
-        self._player_list.pack(side="left", fill="both", expand=True)
-        self._player_list.bind("<<ListboxSelect>>", self._on_list_select)
-
     # -- C2: playlists tab -------------------------------------------------
 
     def _playlist_path(self):
@@ -1217,7 +1177,8 @@ class Overlay(tk.Tk):
         if self._pl_list is None or self.ui_state.player is None:
             return
         try:
-            current = self.ui_state.player.current_url()
+            playback = self.ui_state.playback
+            current = playback.current_url() if playback is not None else self.ui_state.player.current_url()
         except Exception:
             return
         for index, track in enumerate(self._pl_tracks):
@@ -1522,12 +1483,18 @@ class Overlay(tk.Tk):
     def _sync_current_rows(self) -> None:
         """Mark the real current track without changing user selection."""
         player = self.ui_state.player
-        current_url = None
-        if player is not None:
+        playback = self.ui_state.snapshot().get("playback")
+        if playback is not None:
             try:
-                current_url = player.current_url()
-            except Exception:
+                current_url = playback.current_url
+            except AttributeError:
                 current_url = None
+        else:
+            current_url = None
+            try:
+                current_url = player.current_url() if player else None
+            except Exception:
+                pass
         self._current_url = current_url
         if self._voice_preview_list is not None:
             snap = self.ui_state.snapshot()
@@ -1570,12 +1537,13 @@ class Overlay(tk.Tk):
         store = self._store()
         name = self._pl_selected_name()
         player = self.ui_state.player
-        if store is None or name is None or player is None:
+        playback = self.ui_state.playback
+        if store is None or name is None or (player is None and playback is None):
             self._pl_note("nothing is playing", error=True)
             return
-        title = player.current_title()
+        title = playback.current_title() if playback is not None else player.current_title()
         try:
-            url = player.current_url()
+            url = playback.current_url() if playback is not None else player.current_url()
         except Exception:
             url = None
         if not isinstance(url, str) or not url:
@@ -1735,6 +1703,8 @@ class Overlay(tk.Tk):
 
         self._section(inner, "search")
         self._row(inner, "search", "results", cfg.search.results, "int")
+        self._row(inner, "search", "browse_results", cfg.search.browse_results, "int")
+        self._row(inner, "search", "voice_preview_results", cfg.search.voice_preview_results, "int")
         self._row(inner, "search", "cookies_from_browser",
                   cfg.search.cookies_from_browser or "", "str_or_null")
 
@@ -2286,14 +2256,6 @@ class Overlay(tk.Tk):
             "mute", _player_toggle_mute, player, self.ui_state, target
         )
 
-    def _on_list_select(self, _event) -> None:
-        """B5: listbox row -> same handler the compact pool rows use."""
-        if self._player_list is None or self._drag_moved:
-            return
-        picked = self._player_list.curselection()
-        if picked:
-            self._on_pool_click(int(picked[0]))
-
     def _on_pool_click(self, index: int) -> None:
         if self._drag_moved or self.on_pool_click is None:
             return
@@ -2476,8 +2438,8 @@ class Overlay(tk.Tk):
         # --- result pool (compact labels) + B5 expanded listbox ---
         titles = self._pool_titles()
         if self.expanded and self._voice_preview_list is not None:
-            if titles != self._player_titles:
-                self._player_titles = list(titles)
+            if titles != self._preview_titles:
+                self._preview_titles = list(titles)
                 selected = self._voice_preview_list.curselection()
                 self._voice_preview_list.delete(0, "end")
                 for pos, title in enumerate(titles, start=1):
@@ -2494,6 +2456,15 @@ class Overlay(tk.Tk):
                 else:
                     label.configure(text="", fg=FG_DIM)
 
+        playback = self.ui_state.playback
+        playback_snapshot = None
+        if playback is not None:
+            try:
+                playback_snapshot = playback.snapshot()
+                self.ui_state.set_playback_snapshot(playback_snapshot)
+            except Exception:
+                playback_snapshot = None
+
         if self.expanded:
             # B2: now-playing line reuses _now_playing() verbatim (no new player
             # code) instead of rebuilding the title/position/volume string.
@@ -2501,43 +2472,21 @@ class Overlay(tk.Tk):
                 self._now_var.set(self._now_playing() or "Nothing playing")
             if self._queue_var is not None:
                 try:
-                    queue = self.ui_state.player.pool_titles() if self.ui_state.player else []
-                    position = self.ui_state.player.current_position() if self.ui_state.player else None
+                    queue = self.ui_state.playback.pool_titles() if self.ui_state.playback is not None else (
+                        self.ui_state.player.pool_titles() if self.ui_state.player else []
+                    )
+                    position = playback_snapshot.current_index if playback_snapshot is not None else (
+                        self.ui_state.playback.current_position() if self.ui_state.playback is not None else (
+                            self.ui_state.player.current_position() if self.ui_state.player else None
+                        )
+                    )
                     self._queue_var.set(
                         f"Next: {queue[position + 1]}" if queue and position is not None and position + 1 < len(queue)
                         else f"Queue: {len(queue)} track{'s' if len(queue) != 1 else ''}"
                     )
                 except Exception:
                     self._queue_var.set("Queue unavailable")
-            # B5: keep the scrolling list in step with the compact rows.
-            if self._player_list is not None and titles != self._player_titles:
-                self._player_titles = list(titles)
-                selected = self._player_list.curselection()
-                self._player_list.delete(0, "end")
-                for pos, title in enumerate(titles, start=1):
-                    self._player_list.insert(
-                        "end", f"{pos}. {_truncate(title, POOL_MAX_CHARS)}")
-                if selected and selected[0] < len(titles):
-                    self._player_list.select_set(selected[0])
-            # Highlight the real mpv queue position; selection itself remains
-            # the user's next jump target, so automatic sync never loops playback.
             queried = self._tick % PLAYER_POLL_EVERY == 0
-            try:
-                current = (
-                    self.ui_state.player.current_position()
-                    if queried and self.ui_state.player
-                    else None
-                )
-            except Exception:
-                current = None
-            if self._player_list is not None and queried and len(self._player_list.bbox("end")) >= 0:
-                for pos in range(len(titles)):
-                    marker = "▶" if pos == current else ""
-                    self._player_list.itemconfig(
-                        pos, fg=ACCENT if pos == current else FG,
-                        text=(f"{marker} {pos + 1}. " if marker else f"{pos + 1}. ")
-                             + _truncate(titles[pos], POOL_MAX_CHARS),
-                    )
             if queried:
                 self._sync_playlist_highlight()
                 self._sync_current_rows()
@@ -2550,9 +2499,10 @@ class Overlay(tk.Tk):
             self._tick += 1
             if self._tick % PLAYER_POLL_EVERY == 0:
                 player = self.ui_state.player
-                if player is not None and not self._volume_dragging:
+                playback = self.ui_state.playback
+                if (player is not None or playback is not None) and not self._volume_dragging:
                     try:
-                        level = int(round(player.volume()))
+                        level = int(round(playback.volume() if playback is not None else player.volume()))
                         if self._vol_var is not None:
                             self._vol_var.set(level)
                         if self._vol_label is not None:
@@ -2560,9 +2510,10 @@ class Overlay(tk.Tk):
                     except Exception:
                         pass  # mpv restarting: keep the last slider position
             # B6: mic + backend + mpv + AEC, same tick, no new threads.
-            if queried and self.ui_state.player is not None:
+            if queried and (self.ui_state.player is not None or self.ui_state.playback is not None):
                 try:
-                    current_seconds, duration = self.ui_state.player.playback_position()
+                    playback = self.ui_state.playback
+                    current_seconds, duration = (playback.playback_position() if playback is not None else self.ui_state.player.playback_position())
                     self._seek_duration = duration
                     if not self._seek_dragging and self._seek_var is not None:
                         self._seek_var.set(
@@ -2634,16 +2585,17 @@ class Overlay(tk.Tk):
         return f"listening \u2022 {mic}" if mic else "listening (no microphone)"
 
     def _now_playing(self) -> str:
+        playback = self.ui_state.playback
         player = self.ui_state.player
-        if player is None:
+        if playback is None and player is None:
             return ""
         try:
-            titles = player.pool_titles()
-            title = player.current_title() or ""
+            titles = playback.pool_titles() if playback is not None else player.pool_titles()
+            title = (playback.current_title() if playback is not None else player.current_title()) or ""
             if not title:
                 return f"{len(titles)} result(s) queued" if titles else ""
             position = titles.index(title) + 1 if title in titles else 0
-            volume = int(round(player.volume()))
+            volume = int(round(playback.volume() if playback is not None else player.volume()))
             return (
                 f"{_truncate(title, TITLE_MAX_CHARS)} "
                 f"[{position}/{len(titles)}]  vol {volume}%"
@@ -2666,6 +2618,12 @@ class Overlay(tk.Tk):
             return []
 
     def _playing_now(self) -> bool:
+        playback = self.ui_state.playback
+        if playback is not None:
+            try:
+                return playback.snapshot().state.value == "playing"
+            except Exception:
+                return False
         player = self.ui_state.player
         if player is None:
             return False
@@ -2790,7 +2748,7 @@ class Tray:
         """Tear the icon down and join the thread (callable from anywhere)."""
         if self._apis is not None and self._hwnd:
             self._apis.user32.PostMessageW(self._hwnd, self.WM_CLOSE, 0, 0)
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=3.0)
 
     # -- tray thread -----------------------------------------------------
