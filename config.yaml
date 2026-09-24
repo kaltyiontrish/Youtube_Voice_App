@@ -1,100 +1,152 @@
-# voiceyt configuration (plan2.md §10)
-#
-# Every timing value, path and model id lives here - no magic numbers in code.
-# Command words are matched *after* normalization: lower-cased, accents
-# stripped, punctuation removed, whitespace collapsed.  Write verbs without
-# accents.
-
 audio:
-  device: null            # null = system default; --list-devices prints indices
-  sample_rate: 16000      # Hz. The VAD and every ASR backend assume 16 kHz mono.
-
+  device: null
+  sample_rate: 16000
 aec:
-  enabled: false          # start false, see plan2.md §8
-  backend: echoff         # echoff | voiceclean | speexdsp
-  loopback_device: null   # WASAPI loopback index used as the playback reference
-  frame_ms: 10            # AEC frame size: WebRTC APM and Speex both want 10 ms
-  stream_delay_ms: 0      # extra alignment offset applied to the reference
-
+  enabled: false
+  backend: echoff
+  loopback_device: null
+  frame_ms: 10
+  stream_delay_ms: 0
 asr:
-  backend: whisper          # whisper | parakeet | nemotron | vosk (set from --bench results)
+  backend: whisper
   models_dir: ./models
-  device: cuda             # cuda | cpu (cuda: use RTX 2060 for faster-whisper CTranslate2)
-  language: en            # pinned: whisper can only answer in this language;
-                          # parakeet auto-detects per utterance and drifts to
-                          # russian on short clips (proven 2026-09-20)
+  device: cuda
+  language: en
   whisper:
-    model: large-v3-turbo  # any faster-whisper size or a local directory name
-    compute_type: float16    # float16 = fastest on CUDA RTX 2060; auto-downgrades to int8 on CPU
-    beam_size: 1          # greedy keeps latency down (faster-whisper default: 5)
+    model: large-v3-turbo
+    compute_type: float16
+    beam_size: 1
     condition_on_previous_text: false
   parakeet:
-    model_id: nemo-parakeet-tdt-0.6b-v3   # onnx-asr id for nvidia/parakeet-tdt-0.6b-v3
-    quantization: null                    # null | int8
+    model_id: nemo-parakeet-tdt-0.6b-v3
+    quantization: null
   nemotron:
     model_id: codavidgarcia/nemotron-3.5-asr-streaming-0.6b-onnx
-    chunk_ms: 320         # 80/160/320/560/1120 supported by the export tooling
-    precision: fp16       # fp16 | fp32 | int8
-    language: auto        # auto emits <xx-XX> tags; pt-PT is also available
+    chunk_ms: 320
+    precision: fp16
+    language: auto
   vosk:
     model_en: vosk-model-small-en-us-0.15
     model_pt: vosk-model-small-pt-0.3
-    grammar: null               # null = free-form; list = constrain to those phrases
-
+    grammar: null
 vad:
   enabled: true
   model_path: ./models/vad/silero_vad.onnx
   threshold: 0.5
-  min_speech_ms: 150      # ignore shorter blips
-  min_silence_ms: 400     # silence that closes an utterance
-  max_utterance_s: 25     # hard cap, keeps batch backends inside their window
-
+  min_speech_ms: 150
+  min_silence_ms: 400
+  max_utterance_s: 25.0
 trigger:
-  words: [youtube, "you tube", iutube, "u tube", utube]
-  trigger_window_ms: 1500   # how long a verb is still accepted after the trigger
-  silence_end_ms: 800       # silence that ends a query early
-  query_max_ms: 6000        # hard cap on collecting a query
-
+  words:
+  - youtube
+  - you tube
+  - iutube
+  - u tube
+  - utube
+  trigger_window_ms: 1500
+  silence_end_ms: 800
+  query_max_ms: 6000
 player:
   mpv_path: mpv
-  ipc_path: null          # null = auto per OS: \\.\pipe\voiceyt | /tmp/voiceyt.sock
+  ipc_path: null
   audio_only: true
   volume_step: 10
   volume_min: 0
   volume_max: 130
   start_timeout_s: 10
-  extra_args: ["--no-video", "--really-quiet", "--idle=yes"]
-  playlist_path: ./playlists.json   # path to JSON playlist file; null = hides the tab
-
+  extra_args:
+  - --no-video
+  - --really-quiet
+  - --idle=yes
+  playlist_path: ./playlists.json
 search:
-  results: 5              # size of the "proximo" pool
-  cookies_from_browser: null   # e.g. firefox, if bot checks start
+  results: 10
+  cookies_from_browser: null
   socket_timeout_s: 15
-
 behaviour:
   log_transcripts: true
   log_path: ./logs/transcripts.log
   log_level: INFO
   ignore_trigger_ms_after_play: 500
-  require_same_utterance_while_playing: true   # plan2.md §8 step 3
-  ui: true                  # minimal overlay + tray icon (voiceyt.ui)
-
+  require_same_utterance_while_playing: true
+  ui: true
 commands:
-  # English verbs first (primary); the pt-PT spellings stay as aliases.
-  - {action: play,        verbs: [play, passa, toca, poe, mete],             takes_query: true}
-  - {action: next,        verbs: [next, proximo, seguinte, outra, salta],    takes_query: false}
-  - {action: prev,        verbs: [previous, anterior, volta],                takes_query: false}
-  - {action: stop,        verbs: [stop, para, pausa, chega],                 takes_query: false}
-  - {action: resume,      verbs: [continue, continua, retoma],               takes_query: false}
-  - {action: volume_up,   verbs: [louder, "mais alto", aumenta, "sobe o som"], takes_query: false}
-  - {action: volume_down, verbs: [quieter, "mais baixo", baixa, "baixa o som"], takes_query: false}
-
+- action: play
+  verbs:
+  - play
+  - passa
+  - toca
+  - poe
+  - mete
+  takes_query: true
+- action: add
+  verbs:
+  - add
+  - adiciona
+  takes_query: false
+- action: remove
+  verbs:
+  - remove
+  - remover
+  - tira
+  takes_query: false
+- action: jump
+  verbs:
+  - jump
+  - salta para
+  takes_query: true
+- action: next
+  verbs:
+  - next
+  - proximo
+  - seguinte
+  - outra
+  - salta
+  takes_query: false
+- action: prev
+  verbs:
+  - previous
+  - anterior
+  - volta
+  takes_query: false
+- action: pause
+  verbs:
+  - pause
+  - pausa
+  takes_query: false
+- action: stop
+  verbs:
+  - stop
+  - para
+  - chega
+  takes_query: false
+- action: resume
+  verbs:
+  - continue
+  - continua
+  - retoma
+  takes_query: false
+- action: volume_up
+  verbs:
+  - louder
+  - mais alto
+  - aumenta
+  - sobe o som
+  takes_query: false
+- action: volume_down
+  verbs:
+  - quieter
+  - mais baixo
+  - baixa
+  - baixa o som
+  takes_query: false
 ui:
-  overlay_width: 960              # window width in pixels (960-1920)
-  overlay_height: 540             # window height in pixels (540-1080)
-  always_on_top: true             # keep window above others
-  show_playlist: true             # show saved playlist in overlay
-  fade_after_s: 30                # quiet time before overlay dims
-  hide_after_s: 120               # quiet time before overlay hides
-  hide_while_playing: false       # auto-hide overlay when music plays
-  mode: expanded                  # compact | expanded (expanded = tabs + controls)
+  overlay_width: 1100
+  overlay_height: 700
+  always_on_top: true
+  show_playlist: true
+  fade_after_s: 30
+  hide_after_s: 120
+  hide_while_playing: false
+  mode: expanded
+  theme: midnight

@@ -9,10 +9,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
-from voiceyt.config import ConfigError, DEFAULTS, load_config
+from voiceyt.config import (
+    ConfigError,
+    DEFAULTS,
+    atomic_write_text,
+    load_config,
+    save_config_sections,
+)
 
 MINIMAL = {
     "asr": {"backend": "whisper", "device": "cpu", "models_dir": "./models"},
@@ -145,6 +152,17 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self.load_with({"commands": []})
 
+    def test_takes_query_is_play_only(self) -> None:
+        """The matcher has one query slot; a second one hangs later commands."""
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with({
+                "commands": [
+                    {"action": "play", "verbs": ["passa"], "takes_query": True},
+                    {"action": "next", "verbs": ["proximo"], "takes_query": True},
+                ]
+            })
+        self.assertIn("takes_query may only be true for action 'play' or 'jump'", str(caught.exception))
+
     def test_unknown_action_is_a_startup_error(self) -> None:
         from voiceyt.commands import validate_actions
 
@@ -162,7 +180,7 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(
             sorted(known_actions()),
-            ["next", "play", "prev", "resume", "stop", "volume_down", "volume_up"],
+            ["add", "jump", "next", "pause", "play", "prev", "remove", "resume", "stop", "volume_down", "volume_up"],
         )
 
     def test_shipped_config_has_known_actions(self) -> None:
@@ -196,14 +214,24 @@ class UiConfigTests(unittest.TestCase):
     def test_defaults_load(self) -> None:
         ui = self.load_with(MINIMAL).ui_config
         self.assertIsNotNone(ui)
-        self.assertEqual(ui.overlay_width, 960)
-        self.assertEqual(ui.overlay_height, 540)
+        self.assertEqual(ui.theme, "midnight")
+        self.assertEqual(ui.overlay_width, 1100)
+        self.assertEqual(ui.overlay_height, 700)
         self.assertTrue(ui.always_on_top)
         self.assertTrue(ui.show_playlist)
         self.assertEqual(ui.fade_after_s, 30.0)
         self.assertEqual(ui.hide_after_s, 120.0)
         self.assertFalse(ui.hide_while_playing)
         self.assertEqual(ui.mode, "compact")
+
+    def test_theme_round_trips(self) -> None:
+        ui = self.load_with({**MINIMAL, "ui": {"theme": "ocean"}}).ui_config
+        self.assertEqual(ui.theme, "ocean")
+
+    def test_bad_theme_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError) as caught:
+            self.load_with({**MINIMAL, "ui": {"theme": "neon"}})
+        self.assertIn("ui.theme", str(caught.exception))
 
     def test_every_key_round_trips(self) -> None:
         ui = self.load_with(self.ui_overrides()).ui_config
@@ -278,6 +306,26 @@ class PlaylistPathTests(unittest.TestCase):
             with self.assertRaises(ConfigError) as caught:
                 load_config(write_config(Path(temp), {**MINIMAL, "player": {"playlist_path": 42}}))
         self.assertIn("player.playlist_path", str(caught.exception))
+
+
+class AtomicConfigWriteTests(unittest.TestCase):
+    def test_failed_replace_preserves_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.yaml"
+            path.write_text("original: value\n", encoding="utf-8")
+            with patch("voiceyt.config.os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    atomic_write_text(path, "replacement")
+            self.assertEqual(path.read_text(encoding="utf-8"), "original: value\n")
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_section_save_replaces_file_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = write_config(Path(temp), MINIMAL)
+            save_config_sections(path, {"vad": {"enabled": False, "threshold": 0.7}})
+            config = load_config(path)
+            self.assertEqual(config.vad.threshold, 0.7)
+            self.assertEqual(list(path.parent.glob(".*.tmp")), [])
 
 
 if __name__ == "__main__":

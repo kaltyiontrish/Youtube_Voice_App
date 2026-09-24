@@ -87,6 +87,11 @@ class MpvPlayer:
         # re-applies the matching title on every playback-restart event.
         self._title_lock = threading.Lock()
         self._track_titles: list[str] = []
+        self._track_urls: list[str] = []
+        self._queue_results: tuple[SearchResult, ...] = ()
+        self._queue_searcher: Searcher | None = None
+        self._stopped_index = 0
+        self._stopped_seconds = 0.0
 
     # -- lifecycle ------------------------------------------------------- #
 
@@ -410,35 +415,46 @@ class MpvPlayer:
         if mode == "replace":
             self.command("set_property", "pause", False, raise_on_error=False)
 
-    def play_results(self, results: Sequence[SearchResult], searcher: Searcher) -> None:
-        """Replace the queue with *results* and start item 1 once it resolves."""
+    def play_results(
+        self,
+        results: Sequence[SearchResult],
+        searcher: Searcher,
+        start_index: int = 0,
+    ) -> None:
+        """Replace the queue and start at *start_index* (zero-based)."""
         if not results:
             raise PlayerError("nothing to play")
+        if not 0 <= start_index < len(results):
+            raise PlayerError(f"start index {start_index} is out of range")
         self._queue_generation += 1
         generation = self._queue_generation
-        first = searcher.resolve(results[0])
-        # Direct googlevideo URLs carry no metadata, so mpv would show the raw
-        # URL as the track name; titles are re-applied per track on
-        # playback-restart events (see _apply_track_title).
+        original = list(results)
+        ordered = original[start_index:] + original[:start_index]
         with self._title_lock:
-            self._track_titles = [results[0].title]
+            self._track_titles = [item.title for item in ordered]
+            self._track_urls = [item.url for item in ordered]
+        self._queue_results = tuple(original)
+        self._queue_searcher = searcher
+        self._stopped_index = start_index
+        self._stopped_seconds = 0.0
+        first = searcher.resolve(ordered[0])
         self.command("playlist-clear", raise_on_error=False)
         self.load(first, "replace")
-        LOGGER.info("playing: %s", results[0].title)
+        LOGGER.info("playing: %s", ordered[0].title)
         if not self._wait_for_start(6.0):
-            # Rare race: the load is accepted but the stream never starts
-            # (transient fetch failure).  Re-resolve and try exactly once.
-            LOGGER.warning("track did not start; re-resolving once: %s", results[0].title)
+            LOGGER.warning("track did not start; re-resolving once: %s", ordered[0].title)
             try:
-                self.load(searcher.resolve(results[0]), "replace")
+                self.load(searcher.resolve(ordered[0]), "replace")
             except SearchError as exc:
-                raise PlayerError(f"could not re-resolve {results[0].title!r}: {exc}") from exc
+                raise PlayerError(
+                    f"could not re-resolve {ordered[0].title!r}: {exc}"
+                ) from exc
             if not self._wait_for_start(6.0):
                 LOGGER.warning("track still not playing; leaving it to mpv")
-        if len(results) > 1:
+        if len(ordered) > 1:
             threading.Thread(
                 target=self._preload,
-                args=(list(results[1:]), searcher, generation),
+                args=(ordered[1:], searcher, generation),
                 name="mpv-preload",
                 daemon=True,
             ).start()
@@ -469,14 +485,17 @@ class MpvPlayer:
             try:
                 stream = searcher.resolve(item)
             except SearchError as exc:
+                # Stop at the first unresolved item: mpv indices and the title/URL
+                # mapping must remain aligned, so later items cannot shift onto the
+                # wrong metadata row.
                 LOGGER.warning("could not pre-resolve %r: %s", item.title, exc)
-                continue
+                return
             if generation != self._queue_generation or not self.alive:
                 return
             try:
                 self.load(stream, "append")
-                with self._title_lock:
-                    self._track_titles.append(item.title)
+                # Titles/canonical URLs were installed in queue order before
+                # playback started; resolution must not mutate that mapping.
                 LOGGER.info("queued: %s", item.title)
             except PlayerError as exc:
                 LOGGER.warning("could not queue %r: %s", item.title, exc)
@@ -498,9 +517,9 @@ class MpvPlayer:
     def unpause(self) -> bool:
         """Resume after pause/stop: unpause, else replay current playlist entry.
 
-        ``stop`` is pause-style now, so the first branch is the live one; the
-        replay fallback stays for playlists that were cleared some other way
-        (old sessions, external mpv control), which keeps the file mpv just
+        ``pause`` keeps the entry loaded so plain ``set pause=no`` is the live
+        path; the replay fallback stays for entries cleared some other way
+        (hard ``stop``, external mpv control), which keeps the file mpv just
         stopped on.
         """
         self.command("set_property", "pause", False, raise_on_error=False)
@@ -514,11 +533,22 @@ class MpvPlayer:
         except PlayerError:
             position, count = None, None
         if isinstance(position, int) and position >= 0:
-            self.command("playlist-play-index", position, raise_on_error=False)
+            # The current entry is already selected; setting pause=no continues
+            # it without resetting its time position.
             self.command("set_property", "pause", False, raise_on_error=False)
         elif not isinstance(count, int) or count <= 0:
-            # Playlist was cleared by stop: re-add the current file so there is
-            # something to play (mpv keeps playing the same file on "stop").
+            if self._queue_results and self._queue_searcher is not None:
+                resume_seconds = self._stopped_seconds
+                self.play_results(
+                    self._queue_results,
+                    self._queue_searcher,
+                    start_index=self._stopped_index,
+                )
+                if resume_seconds > 0:
+                    self.seek(resume_seconds)
+                return True
+            # Legacy/external queue with no canonical source: preserve the old
+            # best-effort path when mpv still retains a file path.
             current = self.command(
                 "get_property", "path", timeout=2.0, raise_on_error=False
             )
@@ -528,20 +558,25 @@ class MpvPlayer:
         self._playing = True
         return True
 
-    def stop(self) -> bool:
-        """Pause-style stop so ``resume`` always has something to resume.
-
-        mpv's ``stop`` clears the playlist (``playlist-pos`` becomes -1), so
-        the old resume-after-stop path had to guess the track back.  Pausing
-        keeps the entry loaded; ``unpause`` then just flips ``pause`` off.
-        """
+    def pause(self) -> bool:
+        """Hold the current position (``resume`` continues where it left off)."""
         self.command("set_property", "pause", True, raise_on_error=False)
         self._playing = False
         return True
 
-    def pause(self) -> bool:
-        """Alias of :meth:`stop` for the voice/command layer."""
-        return self.stop()
+    def stop(self) -> bool:
+        """Hard stop; remember queue position so Play can restart the selection."""
+        position = self.current_position()
+        if position is not None:
+            self._stopped_index = position
+        try:
+            current, _duration = self.playback_position()
+            self._stopped_seconds = max(0.0, float(current))
+        except (PlayerError, AttributeError, TypeError, ValueError):
+            self._stopped_seconds = 0.0
+        self.command("stop", raise_on_error=False)
+        self._playing = False
+        return True
 
     def volume(self) -> float:
         value = self.command("get_property", "volume", timeout=3.0)
@@ -584,6 +619,16 @@ class MpvPlayer:
         """
         return self._playing
 
+    def current_position(self) -> int | None:
+        """Current zero-based mpv queue position, or ``None`` when stopped."""
+        try:
+            position = self.command(
+                "get_property", "playlist-pos", timeout=2.0, raise_on_error=False
+            )
+        except PlayerError:
+            return None
+        return position if isinstance(position, int) and position >= 0 else None
+
     def current_title(self) -> str | None:
         """Friendly title of the current entry, tracked locally per playlist index.
 
@@ -606,12 +651,36 @@ class MpvPlayer:
         return None
 
     def pool_titles(self) -> list[str]:
-        """Thread-safe snapshot of the 5-result pool titles (for the UI playlist).
-
-        Returns a shallow copy; callers can read without holding any lock.
-        """
+        """Thread-safe snapshot of the queued track titles."""
         with self._title_lock:
             return list(self._track_titles)
+
+    def current_url(self) -> str | None:
+        """Canonical source URL for the current queue entry, never a stream URL."""
+        position = self.current_position()
+        if position is None:
+            return None
+        with self._title_lock:
+            urls = list(self._track_urls)
+        return urls[position] if position < len(urls) else None
+
+    def playback_position(self) -> tuple[float, float | None]:
+        """Current and total playback seconds from mpv."""
+        current = self.command(
+            "get_property", "time-pos", timeout=2.0, raise_on_error=False
+        )
+        duration = self.command(
+            "get_property", "duration", timeout=2.0, raise_on_error=False
+        )
+        return (
+            float(current) if isinstance(current, (int, float)) else 0.0,
+            float(duration) if isinstance(duration, (int, float)) and duration > 0 else None,
+        )
+
+    def seek(self, seconds: float) -> bool:
+        value = max(0.0, float(seconds))
+        self.command("seek", value, "absolute", raise_on_error=True)
+        return True
 
     def status(self) -> MpvStatus:
         try:

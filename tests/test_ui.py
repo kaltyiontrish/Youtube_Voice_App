@@ -17,14 +17,23 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import yaml
 
-from voiceyt.__main__ import _ui_jump_to_pool, _ui_log_pause, _ui_quit, _ui_switch_mic
+from voiceyt.__main__ import _ui_jump_to_pool, _ui_log_pause, _ui_play_playlist, _ui_quit, _ui_switch_mic
 from voiceyt.__main__ import Listener
 from voiceyt.config import UiConfig, load_config
-from voiceyt.ui import Overlay, Tray, UiState, _player_transport, _truncate, _window_size
+from voiceyt.ui import (
+    Overlay,
+    Tray,
+    UiState,
+    _player_transport,
+    _run_in_background,
+    _truncate,
+    _window_size,
+)
 from voiceyt.ui import RECENT_MAX
 
 CONFIG = {
@@ -92,9 +101,40 @@ class UiStateTests(unittest.TestCase):
 class TrayMenuIdTests(unittest.TestCase):
     """Device index -> menu id, which is how the mic submenu reports back."""
 
+    def test_background_helper_does_not_block_caller(self) -> None:
+        finished = threading.Event()
+
+        def work() -> None:
+            finished.set()
+
+        _run_in_background("test", work)
+        self.assertTrue(finished.wait(1.0))
+
     def test_microphone_ids_round_trip(self) -> None:
         for index in (0, 1, 4, 12):
             self.assertEqual(Tray.MENU_MIC_BASE + index - Tray.MENU_MIC_BASE, index)
+    def test_ui_state_persists_volume_and_voice_previews(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "ui_state.json"
+            state = UiState(state_path=path)
+            state.set_volume(73)
+            state.set_voice_previews(["one", "two"])
+            state.set_search_results([{"title": "Browse", "url": "https://x"}], "query")
+            restored = UiState(state_path=path)
+            snapshot = restored.snapshot()
+        self.assertEqual(snapshot["volume"], 73)
+        self.assertEqual(snapshot["voice_previews"], ["one", "two"])
+        self.assertEqual(snapshot["browse_query"], "query")
+        self.assertEqual(snapshot["search_results"][0]["title"], "Browse")
+
+    def test_snapshot_carries_browse_results(self) -> None:
+        state = UiState()
+        state.set_search_results([{"title": "Track", "url": "https://example.test/watch"}])
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["search_results"][0]["title"], "Track")
+        self.assertGreater(snapshot["search_results_ts"], 0)
+
+
 
     def test_menu_ids_do_not_collide(self) -> None:
         self.assertGreater(Tray.MENU_MIC_BASE, Tray.MENU_QUIT)
@@ -215,6 +255,22 @@ class FakePlayer:
     def pool_titles(self) -> list[str]:
         return list(self.titles)
 
+    def current_title(self) -> str | None:
+        return self.titles[0] if self.titles else None
+
+    def current_url(self) -> str:
+        return self.current_title() or ""
+
+    def current_position(self) -> int | None:
+        return 0 if self.playing else None
+
+    def playback_position(self) -> tuple[float, float | None]:
+        return (12.0, 180.0)
+
+    def seek(self, seconds: float) -> bool:
+        self.commands.append(("seek", seconds, "absolute"))
+        return True
+
     def jump_to(self, index: int) -> bool:
         self.jumped.append(index)
         self.playing = True
@@ -224,6 +280,11 @@ class FakePlayer:
         self.commands.append(tuple(args))
 
     def stop(self) -> bool:
+        self.command("stop")
+        self.playing = False
+        return True
+
+    def pause(self) -> bool:
         self.command("set_property", "pause", True)
         self.playing = False
         return True
@@ -268,18 +329,27 @@ class UiCallbackTests(unittest.TestCase):
         self.assertIn("jump #3", self.ui.snapshot()["action"])
 
     def test_transport_stop_then_resume_keeps_the_track(self) -> None:
-        """stop is pause-style now, so resume always has something to resume."""
-        _player_transport(self.player, self.ui, "stop")
+        """pause holds the position, so resume continues where it left off."""
+        _player_transport(self.player, self.ui, "pause")
         self.assertIn(("set_property", "pause", True), self.player.commands)
         self.assertFalse(self.player.playing)
         _player_transport(self.player, self.ui, "resume")
         self.assertIn(("set_property", "pause", False), self.player.commands)
         self.assertTrue(self.player.playing)
 
-    def test_stop_never_issues_a_hard_mpv_stop(self) -> None:
+    def test_stop_still_issues_a_hard_mpv_stop(self) -> None:
+        """stop restarts from the beginning; pause is the position keeper."""
         _player_transport(self.player, self.ui, "stop")
-        bare_stops = [args for args in self.player.commands if args == ("stop",)]
-        self.assertEqual(bare_stops, [])
+        self.assertIn(("stop",), self.player.commands)
+        self.assertFalse(self.player.playing)
+
+    def test_plays_the_music_when_using_player_play_pause(self) -> None:
+        self.player.playing = True
+        _player_transport(self.player, self.ui, "play_pause")
+        self.assertFalse(self.player.playing)
+        self.assertFalse(self.ui.paused.is_set())  # music, not microphone, was paused
+        _player_transport(self.player, self.ui, "play_pause")
+        self.assertTrue(self.player.playing)
 
     def test_pool_click_out_of_range_does_nothing(self) -> None:
         _ui_jump_to_pool(self.player, self.ui, 5)
@@ -297,6 +367,24 @@ class UiCallbackTests(unittest.TestCase):
         _ui_switch_mic(listener, self.ui, 3)
         self.assertEqual(listener.capture.device_index, 3)
         self.assertEqual(self.ui.snapshot()["action"], "microphone: device-3")
+
+    def test_playlist_play_loads_all_tracks_from_selected_index(self) -> None:
+        from types import SimpleNamespace
+
+        calls = []
+        runner = SimpleNamespace(
+            last_play_started=None,
+            play_playlist=lambda results, start_index: calls.append(
+                (results, start_index)
+            ),
+        )
+        tracks = [
+            {"title": "A", "url": "https://youtube.com/watch?v=a"},
+            {"title": "B", "url": "https://youtube.com/watch?v=b"},
+        ]
+        _ui_play_playlist(runner, self.ui, tracks, 1)
+        self.assertEqual(calls[0][1], 1)
+        self.assertEqual([r.title for r in calls[0][0]], ["A", "B"])
 
     def test_failed_microphone_switch_keeps_the_device_and_reports(self) -> None:
         listener = FakeListener()
@@ -438,21 +526,29 @@ class PlayerTabExtrasTests(unittest.TestCase):
         values.update(overrides)
         return UiConfig(**values)
 
-    def build(self, config=None, app_config=None, on_play_query=None):
+    def build(self, config=None, app_config=None, on_play_query=None,
+              on_play_playlist=None, on_browse_query=None):
         try:
             overlay = Overlay(UiState(), config or self.make_config(),
-                              app_config=app_config, on_play_query=on_play_query)
+                              app_config=app_config, on_play_query=on_play_query,
+                              on_play_playlist=on_play_playlist,
+                              on_browse_query=on_browse_query)
         except Exception as exc:  # no display (headless CI)
             self.skipTest(f"cannot open a window: {exc}")
         self.addCleanup(overlay.destroy)
         overlay.update_idletasks()
         return overlay
 
-    def tab_names(self, overlay) -> list[str]:
-        for child in overlay.winfo_children():
-            if child.winfo_class() == "TNotebook":
-                return [child.tab(i, "text") for i in range(child.index("end"))]
-        return []
+    def test_expanded_mode_uses_one_music_page_and_settings(self) -> None:
+        overlay = self.build()
+        self.assertEqual(list(overlay._pages), ["Settings"])
+        self.assertEqual(overlay._active_page, "Settings")
+
+    def _playlist_config(self):
+        from dataclasses import replace
+        return replace(load_test_config(), player=replace(
+            load_test_config().player, playlist_path=Path("playlists.json")
+        ))
 
     @staticmethod
     def texts_in(widget) -> list[str]:
@@ -464,69 +560,156 @@ class PlayerTabExtrasTests(unittest.TestCase):
                 continue
         return out
 
-    def test_expanded_mode_builds_the_player_and_settings_tabs(self) -> None:
-        names = self.tab_names(self.build())
-        self.assertIn("Player", names)
-        self.assertIn("Settings", names)
+    def test_settings_page_remains_available_after_navigation(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        overlay._show_page("Settings")
+        overlay.update_idletasks()
+        self.assertEqual(overlay._active_page, "Settings")
+        self.assertEqual(str(overlay._pages["Settings"].winfo_manager()), "pack")
+        self.assertEqual(overlay._pages["Playlists"].winfo_manager(), "")
 
-    def test_compact_mode_builds_no_tabs(self) -> None:
+    def test_playlist_page_replaces_player_page(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        self.assertNotIn("Player", overlay._pages)
+        self.assertIn("Playlists", overlay._pages)
+        self.assertIsNotNone(overlay._browse_list)
+
+    def test_playlist_list_has_a_scrollbar(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        self.assertIsNotNone(overlay._pl_scroll)
+        self.assertTrue(overlay._pl_list.cget("yscrollcommand"))
+
+    def test_voice_previews_do_not_follow_playlist_queue(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        state = overlay.ui_state
+        state.set_voice_previews(["voice 1", "voice 2"])
+        self.assertEqual(overlay._pool_titles(), ["voice 1", "voice 2"])
+        state.set_voice_previews(["voice 1"])
+        self.assertEqual(overlay._pool_titles(), ["voice 1"])
+
+    def test_voice_preview_list_keeps_user_selection(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        overlay.ui_state.set_voice_previews(["one", "two", "three"])
+        overlay._poll_ui()
+        overlay._voice_preview_list.selection_set(1)
+        overlay._poll_ui()
+        self.assertEqual(overlay._voice_preview_list.curselection(), (1,))
+
+    def test_voice_preview_list_does_not_bind_current_track(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        overlay.ui_state.set_voice_previews(["voice"])
+        overlay._poll_ui()
+        self.assertEqual(overlay._voice_preview_list.curselection(), ())
+
+    def test_volume_keyboard_helpers_stay_clamped(self) -> None:
+        overlay = self.build()
+        overlay._set_volume_local(65.0)
+        overlay._nudge_volume(10.0)
+        self.assertEqual(overlay._vol_var.get(), 75.0)
+        overlay._nudge_volume(1000.0)
+        self.assertEqual(overlay._vol_var.get(), 130.0)
+        overlay._nudge_volume(-1000.0)
+        self.assertEqual(overlay._vol_var.get(), 0.0)
+
+    def test_compact_mode_builds_no_sidebar_pages(self) -> None:
         overlay = self.build(self.make_config(mode="compact"))
-        self.assertEqual(self.tab_names(overlay), [])
+        self.assertEqual(overlay._pages, {})
 
     def test_compact_mode_has_no_history_strip(self) -> None:
         overlay = self.build(self.make_config(mode="compact"))
         self.assertIsNone(overlay._recent_box)
 
-    def test_playlists_tab_is_hidden_without_a_playlist_path(self) -> None:
+    def test_playlists_page_is_hidden_without_a_playlist_path(self) -> None:
         overlay = self.build(app_config=load_test_config())
-        self.assertNotIn("Playlists", self.tab_names(overlay))
+        self.assertNotIn("Playlists", overlay._pages)
         self.assertIsNone(overlay._playlist_path())
 
-    def test_search_box_dispatches_then_clears(self) -> None:
+    def test_browse_double_click_plays_selected_result(self) -> None:
+        calls = []
+        overlay = self.build(
+            app_config=self._playlist_config(),
+            on_play_playlist=lambda tracks, index: calls.append((tracks, index)),
+        )
+        overlay._browse_results = [{
+            "title": "Track", "url": "https://youtube.com/watch?v=abc"
+        }]
+        overlay._browse_list.insert("end", "1. Track")
+        overlay._browse_list.selection_set(0)
+        finished = threading.Event()
+        original = overlay._run_in_background if hasattr(overlay, "_run_in_background") else None
+        # The UI helper uses a daemon worker; wait for the callback to arrive.
+        overlay._browse_double_click(None)
+        for _ in range(20):
+            if calls:
+                break
+            threading.Event().wait(0.05)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0]["title"], "Track")
+
+    def test_search_browses_without_clearing_the_query(self) -> None:
         sent: list[str] = []
-        overlay = self.build(on_play_query=sent.append)
-        overlay._search_var.set("  daft punk  ")
-        overlay._submit_search()
+        called = threading.Event()
+        def browse(value: str) -> None:
+            sent.append(value)
+            called.set()
+        overlay = self.build(app_config=self._playlist_config(), on_browse_query=browse)
+        overlay._search_var.set("daft punk")
+        overlay._submit_browse()
+        self.assertTrue(called.wait(1.0))
         self.assertEqual(sent, ["daft punk"])
-        self.assertEqual(overlay._search_var.get(), "")
+        self.assertEqual(overlay._search_var.get(), "daft punk")
+
+    def test_voice_preview_double_click_with_saved_url_plays(self) -> None:
+        calls = []
+        overlay = self.build(
+            app_config=self._playlist_config(),
+            on_play_playlist=lambda tracks, index: calls.append((tracks, index)),
+        )
+        overlay.ui_state.set_voice_previews(["Voice song"], ["https://youtube.com/watch?v=voice"])
+        overlay._poll_ui()
+        overlay._voice_preview_list.selection_set(0)
+        overlay._voice_preview_double_click(None)
+        for _ in range(20):
+            if calls:
+                break
+            threading.Event().wait(0.05)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0][0]["url"], "https://youtube.com/watch?v=voice")
+
+    def test_voice_preview_double_click_without_saved_url_searches_title(self) -> None:
+        calls = []
+        overlay = self.build(app_config=self._playlist_config(), on_play_query=calls.append)
+        overlay.ui_state.set_voice_previews(["Voice song"], [])
+        overlay._poll_ui()
+        overlay._voice_preview_list.selection_set(0)
+        overlay._voice_preview_double_click(None)
+        for _ in range(20):
+            if calls:
+                break
+            threading.Event().wait(0.05)
+        self.assertEqual(calls, ["Voice song"])
+
+    def test_voice_preview_selection_is_add_source(self) -> None:
+        overlay = self.build(app_config=self._playlist_config())
+        overlay.ui_state.set_voice_previews(["Voice song"], ["https://youtube.com/watch?v=voice"])
+        overlay._poll_ui()
+        overlay._voice_preview_list.selection_set(0)
+        overlay._active_music_source = "preview"
+        self.assertEqual(overlay._active_music_selection(), ("preview", 0))
+
 
     def test_empty_search_does_not_dispatch(self) -> None:
         sent: list[str] = []
-        overlay = self.build(on_play_query=sent.append)
+        overlay = self.build(app_config=self._playlist_config(), on_browse_query=sent.append)
         overlay._search_var.set("   ")
-        overlay._submit_search()
+        overlay._submit_browse()
         self.assertEqual(sent, [])
 
     def test_search_without_a_handler_is_harmless(self) -> None:
-        overlay = self.build()          # on_play_query stays None
+        overlay = self.build(app_config=self._playlist_config())
         overlay._search_var.set("daft punk")
-        overlay._submit_search()        # must not raise
+        overlay._submit_browse()
         self.assertEqual(overlay._search_var.get(), "daft punk")
-
-    def test_recent_chip_reuses_the_play_path(self) -> None:
-        sent: list[str] = []
-        self.build(on_play_query=sent.append)._submit_search("from a chip")
-        self.assertEqual(sent, ["from a chip"])
-
-    def test_recent_strip_renders_one_chip_per_query(self) -> None:
-        overlay = self.build()
-        overlay._refresh_recent(["nirvana", "fado", "classical"])
-        self.assertEqual(len(overlay._recent_buttons), 3)
-        labels = [str(b.cget("text")) for b in overlay._recent_buttons]
-        self.assertEqual(labels[0], "nirvana")
-
-    def test_recent_strip_is_not_rebuilt_when_nothing_changed(self) -> None:
-        overlay = self.build()
-        overlay._refresh_recent(["nirvana"])
-        first = overlay._recent_buttons[0]
-        overlay._refresh_recent(["nirvana"])
-        self.assertIs(overlay._recent_buttons[0], first)
-
-    def test_recent_strip_clears_when_the_list_empties(self) -> None:
-        overlay = self.build()
-        overlay._refresh_recent(["nirvana"])
-        overlay._refresh_recent([])
-        self.assertEqual(overlay._recent_buttons, [])
 
     def test_cheat_sheet_lists_the_trigger_and_verbs(self) -> None:
         app_config = load_test_config()

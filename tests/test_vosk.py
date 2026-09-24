@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
-from voiceyt.asr.vosk import VoskBackend
+from voiceyt.asr.vosk import VoskBackend, _safe_extract_model
 from voiceyt.config import load_config
 
 from test_config import write_config
@@ -57,6 +59,54 @@ class ModelSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             self.assertFalse(backend.is_downloaded(_config_with("en", directory)))
+
+
+class ModelArchiveTests(unittest.TestCase):
+    def _archive(self, name: str) -> zipfile.ZipFile:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(name, "bad")
+        payload.seek(0)
+        return zipfile.ZipFile(payload)
+
+    def test_traversal_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp)
+            with self._archive("../escaped") as archive:
+                with self.assertRaisesRegex(ValueError, "unsafe archive path"):
+                    _safe_extract_model(archive, destination)
+            self.assertFalse((destination.parent / "escaped").exists())
+
+    def test_windows_traversal_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self._archive(r"..\escaped") as archive:
+                with self.assertRaises(ValueError):
+                    _safe_extract_model(archive, Path(temp))
+
+    def test_windows_drive_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self._archive("C:/escaped") as archive:
+                with self.assertRaises(ValueError):
+                    _safe_extract_model(archive, Path(temp))
+
+
+
+    def test_oversized_expansion_is_rejected(self) -> None:
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("large", b"0" * 1_000_000)
+        payload.seek(0)
+        with tempfile.TemporaryDirectory() as temp:
+            with zipfile.ZipFile(payload) as archive:
+                member = archive.infolist()[0]
+                original = member.file_size
+                member.file_size = 3 * 1024 * 1024 * 1024
+                with self.assertRaisesRegex(ValueError, "2 GiB"):
+                    _safe_extract_model(archive, Path(temp))
+                member.file_size = original
+
+
+
 
 
 class TranscribeTests(unittest.TestCase):

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import json
 import logging
 import os
 import shutil
@@ -34,7 +35,8 @@ from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import ttk
 
-from .config import save_config_sections
+from .config import atomic_write_text, save_config_sections
+from .ui_theme import get_theme, theme_names
 
 LOGGER = logging.getLogger(__name__)
 
@@ -60,9 +62,15 @@ WINDOW_WIDTH = 400
 WINDOW_HEIGHT = 214
 WINDOW_POS = "+40+40"
 
-BG = "#11151a"
-FG = "#e8eaed"
-FG_DIM = "#9aa0a6"
+BG = "#101216"
+SURFACE = "#181b20"
+SURFACE_ALT = "#20242a"
+FG = "#f4f6f8"
+FG_DIM = "#9aa1aa"
+ACCENT = "#1db954"
+ACCENT_DIM = "#168a43"
+DANGER = "#f05d5e"
+HOVER = "#303840"
 
 # ---- win32 plumbing --------------------------------------------------------
 # Everything is bound lazily so importing this module stays cheap (and works
@@ -199,9 +207,10 @@ class UiState:
     or through the two :class:`threading.Event` flags.
     """
 
-    def __init__(self, player=None, capture=None):
+    def __init__(self, player=None, capture=None, state_path: Path | None = None):
         self.player = player        # MpvPlayer | None - polled for titles/volume
         self.capture = capture      # AudioCapture | None - marked in the mic menu
+        self.state_path = state_path
         self._lock = threading.Lock()
         self._heard = ""
         self._heard_ts = 0.0
@@ -215,8 +224,54 @@ class UiState:
         self._backend_name = ""     # current ASR backend name
         self._language = ""         # current language
         self._recent: list[str] = []  # E1: newest-first spoken play queries
+        self._search_results: list[dict] = []
+        self._search_results_ts = 0.0
+        self._voice_previews: list[str] = []
+        self._voice_preview_urls: list[str] = []
+        self._last_browse_query = ""
+        self._last_voice_query = ""
+        self._load_saved_state()
         self.paused = threading.Event()
         self.shutdown = threading.Event()
+        self.overlay_done = threading.Event()
+
+    def _load_saved_state(self) -> None:
+        if self.state_path is None or not self.state_path.is_file():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self._recent = [str(item) for item in data.get("recent", [])][:RECENT_MAX]
+            self._search_results = [dict(item) for item in data.get("browse_results", [])]
+            self._search_results_ts = float(data.get("browse_results_ts", 0.0))
+            self._last_browse_query = str(data.get("browse_query", ""))
+            self._last_voice_query = str(data.get("voice_query", ""))
+            self._voice_previews = [str(item) for item in data.get("voice_previews", [])][:POOL_ROWS]
+            self._voice_preview_urls = [str(item) for item in data.get("voice_preview_urls", [])][:POOL_ROWS]
+            if "volume" in data:
+                self._volume = max(0, min(100, int(data["volume"])))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            LOGGER.warning("could not load UI state %s: %s", self.state_path, exc)
+
+    def _save_state(self) -> None:
+        if self.state_path is None:
+            return
+        payload = {
+            "recent": self._recent,
+            "browse_query": self._last_browse_query,
+            "browse_results": self._search_results,
+            "browse_results_ts": self._search_results_ts,
+            "voice_query": self._last_voice_query,
+            "voice_previews": self._voice_previews,
+            "voice_preview_urls": self._voice_preview_urls,
+            "volume": self._volume,
+        }
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp, self.state_path)
+        except OSError as exc:
+            LOGGER.warning("could not save UI state %s: %s", self.state_path, exc)
 
     # -- written by the daemon threads -----------------------------------
 
@@ -235,6 +290,7 @@ class UiState:
     def set_volume(self, volume: int) -> None:
         with self._lock:
             self._volume = max(0, min(100, volume))
+            self._save_state()
 
     def set_playing(self, playing: bool) -> None:
         with self._lock:
@@ -268,6 +324,23 @@ class UiState:
                 return
             self._recent.insert(0, text)
             del self._recent[RECENT_MAX:]
+            self._last_voice_query = text
+            self._save_state()
+
+    def set_voice_previews(self, titles: list[str], urls: list[str] | None = None) -> None:
+        """Show and persist the latest voice results and their canonical URLs."""
+        with self._lock:
+            self._voice_previews = [str(title) for title in titles[:POOL_ROWS]]
+            self._voice_preview_urls = [str(url) for url in (urls or [])[:POOL_ROWS]]
+            self._save_state()
+
+    def set_search_results(self, results: list[dict], query: str = "") -> None:
+        with self._lock:
+            self._search_results = [dict(result) for result in results]
+            self._search_results_ts = time.monotonic()
+            if query.strip():
+                self._last_browse_query = query.strip()
+            self._save_state()
 
     def recent_queries(self) -> list[str]:
         with self._lock:
@@ -289,7 +362,13 @@ class UiState:
                 "aec": self._aec,
                 "backend_name": self._backend_name,
                 "language": self._language,
+                "voice_previews": list(self._voice_previews),
+                "voice_preview_urls": list(self._voice_preview_urls),
                 "recent": list(self._recent),
+                "search_results": [dict(result) for result in self._search_results],
+                "search_results_ts": self._search_results_ts,
+                "browse_query": self._last_browse_query,
+                "voice_query": self._last_voice_query,
             }
 
 
@@ -302,6 +381,14 @@ def list_mics() -> list[tuple[int, str]]:
     except Exception as exc:  # sounddevice can fail when there is no device
         LOGGER.warning("cannot list microphones: %s", exc)
         return []
+
+
+def _format_duration(value) -> str:
+    try:
+        seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return "--:--"
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -410,23 +497,31 @@ def _ask_yes_no(parent, title: str, prompt: str) -> bool:
         return False
 
 
-def _player_transport(player, state: UiState, action: str) -> None:
-    """B3: transport buttons call existing player methods only.
+def _run_in_background(label: str, function, *args) -> None:
+    """Keep slow mpv/yt-dlp work off Tk's event thread."""
+    def worker() -> None:
+        try:
+            function(*args)
+        except Exception:
+            LOGGER.exception("%s failed", label)
 
-    Play/Pause toggles the shared pause flag (``Tray.toggle_pause``
-    semantics); ``stop``/``prev``/``next``/``resume`` map to the matching
-    :class:`MpvPlayer` method.  Loud failures land on the overlay.
-    """
+    threading.Thread(target=worker, name=f"voiceyt-ui-{label}", daemon=True).start()
+
+
+def _player_transport(player, state: UiState, action: str) -> None:
+    """Transport buttons call mpv directly and toggle against live mpv state."""
     if player is None:
         return
     try:
         if action == "play_pause":
-            if state.paused.is_set():
-                state.paused.clear()
-                state.set_action("listening again")
+            # The event-tracked flag can lag immediately after seek. Query the
+            # player once here so one click always performs one transition.
+            if getattr(player, "is_playing", lambda: getattr(player, "playing", False))():
+                player.pause()
             else:
-                state.paused.set()
-                state.set_action("paused")
+                player.unpause()
+        elif action == "pause":
+            player.pause()
         elif action == "stop":
             player.stop()
         elif action == "prev":
@@ -438,6 +533,17 @@ def _player_transport(player, state: UiState, action: str) -> None:
     except Exception as exc:  # mpv may be restarting; report, don't crash
         LOGGER.warning("player %s failed: %s", action, exc)
         state.set_error(f"player: {exc}")
+
+
+def _player_toggle_mute(player, state: UiState, previous: float | None = None) -> None:
+    """Worker-safe mute toggle; Tk callers pass a plain previous value."""
+    current = player.volume()
+    if current > 0:
+        _player_set_volume(player, state, 0.0)
+        state.set_action("muted")
+        return
+    _player_set_volume(player, state, previous if previous is not None else 50.0)
+    state.set_action("unmuted")
 
 
 def _player_set_volume(player, state: UiState, raw_value) -> None:
@@ -454,13 +560,16 @@ def _player_set_volume(player, state: UiState, raw_value) -> None:
 
 
 def _player_step_volume(player, state: UiState, delta: float) -> None:
-    """B4: +/- step buttons -> ``volume_delta()`` (clamps inside)."""
+    """Send UI volume changes directly to mpv; voice dispatch is not involved."""
     if player is None:
         return
     try:
-        player.volume_delta(float(delta))
-    except Exception as exc:  # mpv may be restarting; report, don't crash
-        LOGGER.warning("player volume_delta failed: %s", exc)
+        current = float(state.snapshot().get("volume", 50))
+        target = max(0.0, min(130.0, current + float(delta)))
+        applied = player.set_volume(target)
+        state.set_volume(int(round(applied)))
+    except Exception as exc:
+        LOGGER.warning("player volume step failed: %s", exc)
         state.set_error(f"player: {exc}")
 
 
@@ -530,13 +639,17 @@ class Overlay(tk.Tk):
     """
 
     def __init__(self, state: UiState, config=None, on_pool_click=None,
-                 app_config=None, on_play_query=None):
+                 app_config=None, on_play_query=None, on_play_playlist=None,
+                 on_browse_query=None, on_quit=None):
         super().__init__()
         self.ui_state = state
         self.ui_config = config
         self.app_config = app_config        # D: live Config the tabs read/write
         self.on_pool_click = on_pool_click
         self.on_play_query = on_play_query  # E2: player-tab search box
+        self.on_play_playlist = on_play_playlist  # saved playlists use shared queue
+        self._on_browse_query = on_browse_query  # search is browse-only
+        self._on_quit = on_quit
         self.expanded = config is not None and config.mode == "expanded"
         self._hidden = True
         self._hidden_for_playback = False    # hide_while_playing hid us
@@ -550,11 +663,24 @@ class Overlay(tk.Tk):
         self._player_box: tk.Widget | None = None   # B: player tab (expanded only)
         self._player_list: tk.Listbox | None = None  # B5: scrolling pool rows
         self._player_titles: list[str] = []
-        self._vol_var: tk.DoubleVar | None = None   # B4: slider value
-        self._vol_label: tk.StringVar | None = None  # B4: "75%" readout
-        self._mute_before: float | None = None  # B4: pre-mute volume for the toggle
-        self._now_var: tk.StringVar | None = None   # B1/B2: now-playing line
+        self._voice_preview_list: tk.Listbox | None = None
+        self._voice_preview_scroll: ttk.Scrollbar | None = None
+        self._vol_var = tk.DoubleVar(value=50.0)  # compatibility helper; no slider is shown
+        self._vol_label: tk.StringVar | None = None  # volume readout is in the status line
+        self._mute_before: float | None = None
+        self._volume_dragging = False
+        self._play_pause_button: tk.Button | None = None
+        self._seek_var: tk.DoubleVar | None = None
+        self._seek_label: tk.StringVar | None = None
+        self._seek_dragging = False
+        self._seek_duration: float | None = None
+        self._seek_last_committed: float | None = None
+        self._now_var: tk.StringVar | None = None   # persistent now-playing title
+        self._queue_var: tk.StringVar | None = None
         self._status_var: tk.StringVar | None = None  # B6: status bar text
+        self._browse_list: tk.Listbox | None = None
+        self._browse_results: list[dict] = []
+        self._browse_msg: tk.StringVar | None = None
         # E1/E2/E5: player-tab extras (all expanded-only, all optional)
         self._search_var: tk.StringVar | None = None   # E2: query entry
         self._recent_box: tk.Widget | None = None      # E1: history strip frame
@@ -569,41 +695,186 @@ class Overlay(tk.Tk):
         self._pl_msg: tk.StringVar | None = None
         self._pl_url_var: tk.StringVar | None = None
         self._pl_tracks: list[dict] = []
+        self._pl_drag_hint = tk.StringVar(value="")
+        self._browse_results_ts = 0.0
+        self._pl_drag_index: int | None = None
+        self._pl_drag_last: int | None = None
+        self._pl_drag_origin_y: int | None = None
+        # Which music surface most recently received a user selection.  Keeping
+        # this explicit prevents the generic Add action from silently choosing
+        # a different list when several rows are selected at once.
+        self._active_music_source: str | None = None
+        self._add_button: tk.Button | None = None
+        self._current_url: str | None = None
+        self.theme_name = config.theme if config is not None else "midnight"
+
         # D: settings tab (StringVar per dotted key + a kind for coercion)
         self._set_vars: dict[tuple[str, str], tk.Variable] = {}
         self._set_kinds: dict[tuple[str, str], str] = {}
+        self._set_dirty = False
+        self._settings_loaded_values: dict[tuple[str, str], object] = {}
         self._set_msg: tk.StringVar | None = None
         self._cmd_vars: dict[str, tuple[tk.StringVar, tk.BooleanVar]] = {}
         self._set_backend_var: tk.StringVar | None = None
         self._set_mic_var: tk.StringVar | None = None
         self._set_mics: list[tuple[int, str]] = []
+        self._pages: dict[str, tk.Widget] = {}
+        self._nav_buttons: dict[str, tk.Widget] = {}
+        self._active_page = "Playlists"
+        self._setup_theme()
         self._build_ui()
         self.after(POLL_MS, self._poll_ui)
+    def _setup_theme(self) -> None:
+        self.theme_name = self.theme_name if self.theme_name in theme_names() else "midnight"
+        palette = get_theme(self.theme_name)
+        global BG, SURFACE, SURFACE_ALT, FG, FG_DIM, ACCENT, ACCENT_DIM, DANGER, HOVER
+        BG = palette["background"]
+        SURFACE = palette["surface"]
+        SURFACE_ALT = palette["surface_alt"]
+        HOVER = palette["hover"]
+        FG = palette["text"]
+        FG_DIM = palette["text_dim"]
+        ACCENT = palette["accent"]
+        ACCENT_DIM = palette["accent_dim"]
+        DANGER = palette["danger"]
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Modern.Horizontal.TScale", background=SURFACE,
+                        troughcolor=SURFACE_ALT, bordercolor=SURFACE,
+                        lightcolor=ACCENT, darkcolor=ACCENT)
+        style.configure("Modern.Vertical.TScrollbar", background=SURFACE_ALT,
+                        troughcolor=BG, bordercolor=BG, arrowcolor=FG_DIM)
+        style.configure(
+            "Modern.TCombobox", fieldbackground=SURFACE_ALT, background=SURFACE_ALT,
+            foreground=FG, arrowcolor=FG, bordercolor=SURFACE_ALT,
+            lightcolor=SURFACE_ALT, darkcolor=SURFACE_ALT, padding=(8, 6),
+        )
+        style.map(
+            "Modern.TCombobox",
+            fieldbackground=[("readonly", SURFACE_ALT)],
+            foreground=[("readonly", FG)], selectbackground=[("readonly", SURFACE_ALT)],
+            selectforeground=[("readonly", FG)],
+        )
+        style.map("Modern.Horizontal.TScale", background=[("active", ACCENT)])
+
+    def _show_page(self, name: str) -> None:
+        page = self._pages.get(name)
+        if page is None:
+            return
+        for other in self._pages.values():
+            other.pack_forget()
+        page.pack(fill="both", expand=True)
+        self._active_page = name
+        for key, button in self._nav_buttons.items():
+            active = key == name
+            button.configure(
+                bg=ACCENT if active else SURFACE,
+                fg="#07130b" if active else FG_DIM,
+                activebackground=ACCENT_DIM if active else HOVER,
+                activeforeground="#07130b" if active else FG,
+            )
+
+    # -- construction ----------------------------------------------------
+
 
     # -- construction ----------------------------------------------------
 
     def _build_ui(self) -> None:
-        self.overrideredirect(True)          # no title bar, no taskbar entry
+        self.overrideredirect(True)
         self.attributes(
             "-topmost",
             self.ui_config.always_on_top if self.ui_config is not None else True,
         )
         self.configure(bg=BG)
-        self._born = time.monotonic()        # for the startup quiet timer
+        self._born = time.monotonic()
         self.geometry(f"{self._win_width}x{self._win_height}{WINDOW_POS}")
-        self.show()                          # visible at startup ("listening")
-        # Drag a frameless window by holding the left button anywhere and
-        # moving: pool rows still get their click when there is no motion.
+        self.show()
         self._drag_xy: tuple[int, int] | None = None
         self._drag_moved = False
-        self.bind("<ButtonPress-1>", self._drag_start)
-        self.bind("<B1-Motion>", self._drag_move)
-        self.bind("<ButtonRelease-1>", self._drag_end)
-
         if self.expanded:
             self._build_expanded_ui()
         else:
             self._build_compact_ui()
+
+    def _build_voice_header(self) -> None:
+        """Expanded top status: transcript, mic gain, and five voice previews."""
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=18, pady=(10, 4))
+        header.bind("<ButtonPress-1>", self._drag_start)
+        header.bind("<B1-Motion>", self._drag_move)
+        header.bind("<ButtonRelease-1>", self._drag_end)
+        row = tk.Frame(header, bg=BG)
+        row.pack(fill="x")
+        for widget in (row,):
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<ButtonRelease-1>", self._drag_end)
+        self._close_button = tk.Button(
+            row, text="X", width=3, relief="flat", bd=0,
+            bg=BG, fg=FG_DIM, activebackground=DANGER, activeforeground=FG,
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+            command=self._close_app,
+        )
+        self._close_button.pack(side="right", padx=(8, 0))
+        self._dot = tk.Canvas(row, width=14, height=14, bg=BG, highlightthickness=0)
+        self._dot.pack(side="left", padx=(0, 10))
+        for widget in (header, self._dot):
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<ButtonRelease-1>", self._drag_end)
+        self._dot_id = self._dot.create_oval(2, 2, 12, 12, fill=DOT_OFF, outline="")
+        self._heard_var = tk.StringVar(value="Say: youtube play <music>")
+        self._heard_label = tk.Label(
+            row, textvariable=self._heard_var, fg=FG, bg=BG, anchor="w",
+            font=("Segoe UI", 12, "bold"), wraplength=self._win_width - 90,
+        )
+        self._heard_label.pack(side="left", fill="x", expand=True)
+        for widget in (self._heard_label,):
+            widget.bind("<ButtonPress-1>", self._drag_start)
+            widget.bind("<B1-Motion>", self._drag_move)
+            widget.bind("<ButtonRelease-1>", self._drag_end)
+        self._meter = tk.Canvas(header, height=6, bg=BG, highlightthickness=0)
+        self._meter.pack(fill="x", pady=(6, 3))
+        self._meter.create_rectangle(
+            0, 0, self._win_width - 36, 6, fill=SURFACE_ALT, width=0
+        )
+        self._meter_id = self._meter.create_rectangle(0, 0, 0, 6, fill=ACCENT, width=0)
+        self._action_var = tk.StringVar(value="Listening")
+        tk.Label(header, textvariable=self._action_var, fg=FG_DIM, bg=BG,
+                 anchor="w", font=("Segoe UI", 8)).pack(fill="x")
+        preview_box = tk.Frame(self, bg=BG)
+        preview_box.pack(fill="x", padx=18, pady=(3, 6))
+        self._voice_preview_scroll = ttk.Scrollbar(
+            preview_box, orient="vertical", style="Modern.Vertical.TScrollbar"
+        )
+        self._voice_preview_list = tk.Listbox(
+            preview_box, bg=SURFACE, fg=FG, bd=0, highlightthickness=0,
+            height=POOL_ROWS, selectmode="browse", activestyle="none",
+            selectbackground=ACCENT_DIM, selectforeground=FG,
+            yscrollcommand=self._voice_preview_scroll.set,
+            font=("Segoe UI", 8),
+        )
+        self._voice_preview_scroll.config(command=self._voice_preview_list.yview)
+        self._voice_preview_scroll.pack(side="right", fill="y")
+        self._voice_preview_list.pack(side="left", fill="both", expand=True)
+        self._voice_preview_list.bind("<Double-Button-1>", self._voice_preview_double_click)
+        self._voice_preview_list.bind("<Return>", lambda _e: self._voice_preview_double_click(None))
+        self._voice_preview_list.bind("<space>", lambda _e: self._toggle_playback())
+        self._voice_preview_list.bind(
+            "<Button-1>", lambda _e: setattr(self, "_active_music_source", "preview")
+        )
+        self._voice_preview_list.bind(
+            "<<ListboxSelect>>", lambda _e: setattr(self, "_active_music_source", "preview")
+        )
+        for widget in (self._voice_preview_list,):
+            widget.configure(takefocus=1, highlightthickness=1, highlightbackground=SURFACE_ALT,
+                              highlightcolor=ACCENT)
+        # Keep the old attribute for compact-mode compatibility; the expanded
+        # preview surface is a real listbox and owns its selection.
+        self._pool_labels: list[tk.Widget] = []
 
     def _build_compact_ui(self) -> None:
         """Today's 400x214 single panel, byte for byte the old _build_ui."""
@@ -668,25 +939,119 @@ class Overlay(tk.Tk):
             self._pool_labels.append(label)
 
     def _build_expanded_ui(self) -> None:
-        """B: header widgets move up unchanged, then notebook + status bar."""
-        self._build_compact_ui()  # B1: same widgets, same logic, now the top
-        book = ttk.Notebook(self)
-        book.pack(fill="both", expand=True, padx=14, pady=(6, 4))
-        self._player_box = tk.Frame(book, bg=BG)
-        book.add(self._player_box, text="Player")
-        self._build_player_tab(self._player_box)
-        # C4: playlist_path: null hides the tab entirely.
+        """Modern shell: sidebar pages with a persistent player bar."""
+        self._build_voice_header()
+        self._build_persistent_player_bar()
+        shell = tk.Frame(self, bg=BG)
+        shell.pack(fill="both", expand=True, padx=12, pady=(4, 0))
+        sidebar = tk.Frame(shell, bg="#0c0e11", width=176)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        tk.Label(sidebar, text="VOICEYT", bg="#0c0e11", fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=18, pady=(10, 18))
+        content = tk.Frame(shell, bg=BG)
+        content.pack(side="left", fill="both", expand=True, padx=(18, 0))
+
+        pages = []
         if self._playlist_path() is not None:
-            playlists = tk.Frame(book, bg=BG)
-            book.add(playlists, text="Playlists")
+            playlists = tk.Frame(content, bg=BG)
+            self._pages["Playlists"] = playlists
             self._build_playlists_tab(playlists)
-        settings = tk.Frame(book, bg=BG)
-        book.add(settings, text="Settings")
+            self._build_browse_area(playlists)
+            pages.append(("Playlists", playlists))
+        settings = tk.Frame(content, bg=BG)
+        self._pages["Settings"] = settings
         self._build_settings_tab(settings)
+        pages.append(("Settings", settings))
+
+        for name, _page in pages:
+            button = tk.Button(
+                sidebar, text=name, anchor="w", padx=18, pady=8,
+                bg=SURFACE, fg=FG_DIM, activebackground=ACCENT,
+                activeforeground="#07130b", relief="flat", bd=0,
+                font=("Segoe UI", 10), cursor="hand2",
+                command=lambda n=name: self._show_page(n),
+            )
+            button.pack(fill="x", pady=2)
+            self._nav_buttons[name] = button
+        self._show_page("Playlists" if "Playlists" in self._pages else "Settings")
         self._status_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self._status_var, bg=BG, fg=FG_DIM,
-                 anchor="w", font=("Segoe UI", 9)).pack(
-                     fill="x", padx=14, pady=(0, 8))  # B6: 28px status bar
+        tk.Label(self, textvariable=self._status_var, bg=SURFACE, fg=FG_DIM,
+                 anchor="w", font=("Segoe UI", 8), padx=12).pack(
+                     fill="x", padx=12, pady=(4, 8), ipady=4)
+    def _build_persistent_player_bar(self) -> None:
+        """Global transport with a real 0-100% song-position slider."""
+        bar = tk.Frame(self, bg=SURFACE, padx=12, pady=6)
+        bar.pack(fill="x", padx=12, pady=(4, 0), side="bottom")
+        row = tk.Frame(bar, bg=SURFACE)
+        row.pack(side="left")
+        for text, action in (("⏮", "prev"), ("▶", "play_pause"),
+                             ("⏭", "next"), ("■", "stop")):
+            primary = action == "play_pause"
+            button = tk.Button(
+                row, text=text, width=3, bg=ACCENT if primary else SURFACE_ALT,
+                fg="#07130b" if primary else FG, activebackground=ACCENT_DIM,
+                relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 10),
+                command=lambda a=action: _run_in_background(
+                    "transport", _player_transport,
+                    self.ui_state.player, self.ui_state, a,
+                ),
+            )
+            button.pack(side="left", padx=2)
+            if action == "play_pause":
+                self._play_pause_button = button
+
+        seek = tk.Frame(bar, bg=SURFACE)
+        seek.pack(side="left", fill="x", expand=True, padx=(18, 0))
+        info = tk.Frame(seek, bg=SURFACE)
+        info.pack(fill="x", pady=(0, 2))
+        self._now_var = tk.StringVar(value="Nothing playing")
+        self._queue_var = tk.StringVar(value="Queue empty")
+        tk.Label(info, textvariable=self._now_var, bg=SURFACE, fg=FG,
+                 anchor="w", font=("Segoe UI", 9, "bold")).pack(
+                     side="left", fill="x", expand=True)
+        tk.Label(info, textvariable=self._queue_var, bg=SURFACE, fg=FG_DIM,
+                 anchor="e", font=("Segoe UI", 8)).pack(side="right")
+        self._seek_label = tk.StringVar(value="0:00 / --:--")
+        tk.Label(seek, textvariable=self._seek_label, bg=SURFACE, fg=FG_DIM,
+                 width=13, font=("Segoe UI", 8)).pack(side="left")
+        self._seek_var = tk.DoubleVar(value=0.0)
+        self._seek_scale = tk.Canvas(
+            seek, height=18, bg=SURFACE, highlightthickness=0,
+            cursor="hand2", takefocus=1,
+        )
+        self._seek_scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._seek_track_id = self._seek_scale.create_rectangle(
+            0, 8, 100, 11, fill=SURFACE_ALT, outline=""
+        )
+        self._seek_fill_id = self._seek_scale.create_rectangle(
+            0, 8, 0, 11, fill=ACCENT, outline=""
+        )
+        self._seek_handle_id = self._seek_scale.create_oval(
+            93, 4, 107, 18, fill=ACCENT, outline=""
+        )
+        self._seek_scale.bind("<Configure>", lambda _e: self._draw_seek())
+        self._seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
+        self._seek_scale.bind("<B1-Motion>", self._on_seek_motion)
+        self._seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
+        self._seek_scale.bind("<Return>", lambda _e: self._toggle_playback())
+        self._seek_scale.bind("<space>", lambda _e: self._toggle_playback())
+
+        volume = tk.Frame(bar, bg=SURFACE)
+        volume.pack(side="right")
+        step = getattr(self.ui_state.player, "volume_step", 10)
+        tk.Button(volume, text="−", width=3, bg=SURFACE_ALT, fg=FG,
+                  activebackground=ACCENT_DIM, relief="flat", bd=0,
+                  command=lambda: self._ui_step_volume(-step)).pack(side="left")
+        tk.Button(volume, text="+", width=3, bg=SURFACE_ALT, fg=FG,
+                  activebackground=ACCENT_DIM, relief="flat", bd=0,
+                  command=lambda: self._ui_step_volume(step)).pack(side="left", padx=(2, 0))
+        self._vol_label = tk.StringVar(value="")
+        tk.Label(volume, textvariable=self._vol_label, bg=SURFACE, fg=FG_DIM,
+                 width=5, font=("Segoe UI", 8)).pack(side="left", padx=6)
+        tk.Button(volume, text="Mute", width=6, bg=SURFACE_ALT, fg=FG,
+                  activebackground=ACCENT_DIM, relief="flat", bd=0,
+                  command=self._on_mute_toggle).pack(side="left", padx=(4, 0))
 
     def _build_player_tab(self, parent: tk.Widget) -> None:
         """B2-B5: now-playing + transport + volume + pool list.
@@ -699,69 +1064,50 @@ class Overlay(tk.Tk):
         search = tk.Frame(parent, bg=BG)
         search.pack(fill="x", pady=(6, 2))
         self._search_var = tk.StringVar(value="")
-        entry = tk.Entry(search, textvariable=self._search_var, bg="#1a2027",
+        entry = tk.Entry(search, textvariable=self._search_var, bg=SURFACE_ALT,
                          fg=FG, insertbackground=FG, relief="flat",
                          highlightthickness=0, font=("Segoe UI", 10))
-        entry.pack(side="left", fill="x", expand=True, ipady=3)
+        entry.pack(side="left", fill="x", expand=True, ipady=5)
         entry.bind("<Return>", lambda _event: self._submit_search())
-        tk.Button(search, text="Search", width=8,
-                  command=self._submit_search).pack(side="left", padx=(6, 0))
-        tk.Button(search, text="?", width=3,
-                  command=self._show_cheatsheet).pack(side="left", padx=(6, 0))
+        tk.Button(search, text="Search", width=9, bg=ACCENT, fg="#07130b",
+                  activebackground=ACCENT_DIM, activeforeground=FG,
+                  relief="flat", bd=0, command=self._submit_search).pack(
+                      side="left", padx=(8, 0), ipady=4)
+        tk.Button(search, text="?", width=3, bg=SURFACE, fg=FG_DIM,
+                  relief="flat", bd=0, command=self._show_cheatsheet).pack(
+                      side="left", padx=(6, 0), ipady=4)
 
         # E1: newest-first strip of the last spoken play queries (filled by
         # _refresh_recent on the poll tick, never rebuilt unless it changed).
         self._recent_box = tk.Frame(parent, bg=BG)
         self._recent_box.pack(fill="x", pady=(0, 2))
 
-        self._now_var = tk.StringVar(value="")
-        tk.Label(parent, textvariable=self._now_var, bg=BG, fg=FG,
-                 anchor="w", font=("Segoe UI", 12, "bold"),
-                 wraplength=self._win_width - 60).pack(fill="x", pady=(6, 2))
-        # B3: Play/Pause toggles the pause flag; the rest call player methods.
-        row = tk.Frame(parent, bg=BG)
-        row.pack(fill="x", pady=(0, 4))
-        for text, action in (("⏯ Play/Pause", "play_pause"), ("⏹ Stop", "stop"),
-                             ("⏮ Prev", "prev"), ("⏭ Next", "next"),
-                             ("▶ Resume", "resume")):
-            tk.Button(row, text=text, width=11,
-                      command=lambda a=action: _player_transport(
-                          self.ui_state.player, self.ui_state, a),
-                      ).pack(side="left", padx=(0, 6))
-        # B4: slider commits on release; +/- nudge by volume_step.
-        vol = tk.Frame(parent, bg=BG)
-        vol.pack(fill="x", pady=(0, 4))
-        step = getattr(self.ui_state.player, "volume_step", 10)
-        tk.Button(vol, text="-", width=3,
-                  command=lambda: _player_step_volume(
-                      self.ui_state.player, self.ui_state, -step),
-                  ).pack(side="left")
-        self._vol_var = tk.DoubleVar(value=50.0)
-        scale = tk.Scale(vol, from_=0, to=130, orient="horizontal", bg=BG,
-                         fg=FG, highlightthickness=0, showvalue=False,
-                         length=220, variable=self._vol_var,
-                         command=lambda _v: self._vol_var and self._vol_label
-                         and self._vol_label.set(f"{float(_v):.0f}%"))
-        scale.bind("<ButtonPress-1>", lambda _e: setattr(self, "_volume_dragging", True))
-        scale.bind("<ButtonRelease-1>", self._on_volume_release)
-        scale.pack(side="left", padx=8)
-        tk.Button(vol, text="+", width=3,
-                  command=lambda: _player_step_volume(
-                      self.ui_state.player, self.ui_state, step),
-                  ).pack(side="left")
-        self._vol_label = tk.StringVar(value="50%")
-        tk.Label(vol, textvariable=self._vol_label, bg=BG, fg=FG_DIM,
-                 font=("Segoe UI", 9), width=5).pack(side="left")
-        tk.Button(vol, text="mute", width=5,
-                  command=self._on_mute_toggle).pack(side="left", padx=(6, 0))
+        self._now_var = tk.StringVar(value="Nothing playing")
+        tk.Label(parent, textvariable=self._now_var, bg=SURFACE, fg=FG,
+                 anchor="w", font=("Segoe UI", 16, "bold"), padx=14,
+                 pady=10).pack(fill="x", pady=(8, 4))
+        seek = tk.Frame(parent, bg=BG, padx=14)
+        seek.pack(fill="x", pady=(0, 6))
+        self._seek_label = tk.StringVar(value="0:00 / --:--")
+        tk.Label(seek, textvariable=self._seek_label, bg=BG, fg=FG_DIM,
+                 width=13, font=("Segoe UI", 8)).pack(side="left")
+        self._seek_var = tk.DoubleVar(value=0.0)
+        scale = ttk.Scale(seek, from_=0, to=100, variable=self._seek_var,
+                          style="Modern.Horizontal.TScale")
+        scale.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        scale.bind("<ButtonPress-1>", self._on_seek_press)
+        scale.bind("<B1-Motion>", self._on_seek_motion)
+        scale.bind("<ButtonRelease-1>", self._on_seek_release)
         # B5: listbox with scrollbar; click = jump via the same bounds check.
         box = tk.Frame(parent, bg=BG)
         box.pack(fill="both", expand=True)
         scroll = tk.Scrollbar(box, orient="vertical")
-        self._player_list = tk.Listbox(box, bg="#1a2027", fg=FG,
-                                       font=("Segoe UI", 10), height=5,
+        self._player_list = tk.Listbox(box, bg=SURFACE, fg=FG, bd=0,
+                                       highlightthickness=0, height=7,
                                        yscrollcommand=scroll.set,
-                                       activestyle="none")
+                                       selectbackground=ACCENT_DIM,
+                                       selectforeground=FG,
+                                       font=("Segoe UI", 10), activestyle="none")
         scroll.config(command=self._player_list.yview)
         scroll.pack(side="right", fill="y")
         self._player_list.pack(side="left", fill="both", expand=True)
@@ -798,33 +1144,64 @@ class Overlay(tk.Tk):
         pick.pack(fill="x", padx=6, pady=(8, 2))
         self._pl_var = tk.StringVar(value="")
         self._pl_combo = ttk.Combobox(pick, textvariable=self._pl_var,
-                                      values=[], width=26, state="readonly")
+                                      values=[], width=30, state="readonly",
+                                      style="Modern.TCombobox")
         self._pl_combo.pack(side="left")
         self._pl_combo.bind("<<ComboboxSelected>>",
                             lambda _e: self._pl_reload_tracks())
         for text, command in (("New", self._pl_new), ("Rename", self._pl_rename),
                               ("Delete", self._pl_delete)):
-            tk.Button(pick, text=text, command=command).pack(
-                side="left", padx=(6, 0))
+            tk.Button(pick, text=text, bg=SURFACE_ALT, fg=FG,
+                      activebackground=ACCENT_DIM, relief="flat", bd=0,
+                      command=command).pack(side="left", padx=(6, 0))
 
         body = tk.Frame(parent, bg=BG)
         body.pack(fill="both", expand=True, padx=6, pady=(4, 0))
-        self._pl_list = tk.Listbox(body, bg="#1a2027", fg=FG, bd=0,
+        track_area = tk.Frame(body, bg=BG)
+        track_area.pack(side="left", fill="both", expand=True)
+        self._pl_list = tk.Listbox(track_area, bg=SURFACE, fg=FG, bd=0,
                                    highlightthickness=0,
-                                   selectbackground="#2d3f52",
+                                   selectbackground=ACCENT_DIM,
+                                   selectforeground=FG,
                                    font=("Segoe UI", 9), activestyle="none")
+        self._pl_drag_hint_label = tk.Label(
+            body, textvariable=self._pl_drag_hint, bg=BG, fg=ACCENT,
+            anchor="w", font=("Segoe UI", 8),
+        )
+        self._pl_drag_hint_label.pack(side="top", fill="x", pady=(0, 2))
+        self._pl_scroll = ttk.Scrollbar(track_area, orient="vertical", command=self._pl_list.yview)
+        self._pl_list.configure(yscrollcommand=self._pl_scroll.set)
+        self._pl_scroll.pack(side="right", fill="y", padx=(4, 0))
         self._pl_list.pack(side="left", fill="both", expand=True)
+        self._pl_list.configure(takefocus=1, highlightthickness=1,
+                                highlightbackground=SURFACE_ALT, highlightcolor=ACCENT)
+        self._pl_list.bind(
+            "<Button-1>", lambda _e: setattr(self, "_active_music_source", "playlist")
+        )
+        self._pl_list.bind("<<ListboxSelect>>",
+                           lambda _e: setattr(self, "_active_music_source", "playlist"))
         self._pl_list.bind("<Double-Button-1>", lambda _e: self._pl_play())
+        self._pl_list.bind("<Return>", lambda _e: self._pl_play())
+        self._pl_list.bind("<space>", lambda _e: self._toggle_playback())
+        self._pl_list.bind("<Delete>", lambda _e: self._pl_remove())
+        self._pl_list.bind("<Control-a>", lambda _e: self._add_selected_music())
+        self._pl_list.bind("<Control-Up>", lambda _e: self._pl_move_key(-1))
+        self._pl_list.bind("<Control-Down>", lambda _e: self._pl_move_key(1))
+        self._pl_list.bind("<ButtonPress-1>", self._pl_drag_start)
+        self._pl_list.bind("<B1-Motion>", self._pl_drag_motion)
+        self._pl_list.bind("<ButtonRelease-1>", self._pl_drag_end)
 
         side = tk.Frame(body, bg=BG)
-        side.pack(side="left", fill="y", padx=(6, 0))
+        side.pack(side="right", fill="y", padx=(6, 0))
         for text, command in (("Play", self._pl_play),
-                              ("Add current", self._pl_add_current),
-                              ("Up", lambda: self._pl_move(-1)),
-                              ("Down", lambda: self._pl_move(1)),
+                              ("Add", self._add_selected_music),
                               ("Remove", self._pl_remove)):
-            tk.Button(side, text=text, width=11, command=command).pack(
-                fill="x", pady=(0, 4))
+            button = tk.Button(side, text=text, width=11, bg=SURFACE_ALT, fg=FG,
+                       activebackground=ACCENT_DIM, relief="flat", bd=0,
+                       command=command)
+            button.pack(fill="x", pady=(0, 4))
+            if text == "Add":
+                self._add_button = button
 
         self._pl_url_var = tk.StringVar(value="")
         tk.Label(parent, textvariable=self._pl_url_var, bg=BG, fg=FG_DIM,
@@ -834,6 +1211,151 @@ class Overlay(tk.Tk):
         tk.Label(parent, textvariable=self._pl_msg, bg=BG, fg=FG_DIM,
                  anchor="w", font=("Segoe UI", 8)).pack(fill="x", padx=6)
         self._pl_refresh()
+
+    def _sync_playlist_highlight(self) -> None:
+        """Show the active saved track even when Playback lives on Player."""
+        if self._pl_list is None or self.ui_state.player is None:
+            return
+        try:
+            current = self.ui_state.player.current_url()
+        except Exception:
+            return
+        for index, track in enumerate(self._pl_tracks):
+            if current and track.get("url") == current:
+                self._pl_list.selection_clear(0, "end")
+                self._pl_list.selection_set(index)
+                self._pl_list.activate(index)
+                self._pl_list.see(index)
+                return
+
+    def _build_browse_area(self, parent: tk.Widget) -> None:
+        """Browse search lists music; playback starts only on explicit selection."""
+        tk.Frame(parent, bg=SURFACE, height=1).pack(fill="x", padx=6, pady=(8, 4))
+        tk.Label(parent, text="Browse music", bg=BG, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=6)
+        search = tk.Frame(parent, bg=BG)
+        search.pack(fill="x", padx=6, pady=(4, 2))
+        self._search_var = tk.StringVar(value=self.ui_state.snapshot().get("browse_query", ""))
+        entry = tk.Entry(search, textvariable=self._search_var, bg=SURFACE_ALT,
+                         fg=FG, insertbackground=FG, relief="flat",
+                         highlightthickness=0, font=("Segoe UI", 10))
+        entry.pack(side="left", fill="x", expand=True, ipady=5)
+        entry.bind("<Return>", lambda _event: self._submit_browse())
+        tk.Button(search, text="Search", width=9, bg=ACCENT, fg="#07130b",
+                  activebackground=ACCENT_DIM, relief="flat", bd=0,
+                  command=self._submit_browse).pack(side="left", padx=(8, 0), ipady=4)
+        self._browse_msg = tk.StringVar(value="Search does not start playback")
+        tk.Label(parent, textvariable=self._browse_msg, bg=BG, fg=FG_DIM,
+                 anchor="w", font=("Segoe UI", 8)).pack(fill="x", padx=6)
+        browse_box = tk.Frame(parent, bg=BG)
+        browse_box.pack(fill="both", expand=True, padx=6, pady=(3, 6))
+        self._browse_scroll = ttk.Scrollbar(browse_box, orient="vertical")
+        self._browse_list = tk.Listbox(browse_box, bg=SURFACE, fg=FG, bd=0,
+                                       highlightthickness=0, height=10,
+                                       selectbackground=ACCENT_DIM,
+                                       selectforeground=FG, activestyle="none",
+                                       yscrollcommand=self._browse_scroll.set)
+        self._browse_scroll.pack(side="right", fill="y", padx=(4, 0))
+        self._browse_list.pack(side="left", fill="both", expand=True, padx=6, pady=(3, 6))
+        self._browse_list.configure(takefocus=1, highlightthickness=1,
+                                     highlightbackground=SURFACE_ALT, highlightcolor=ACCENT)
+        self._browse_scroll.config(command=self._browse_list.yview)
+        self._browse_list.bind("<<ListboxSelect>>",
+                               lambda _e: setattr(self, "_active_music_source", "browse"))
+        self._browse_list.bind("<Double-Button-1>", self._browse_double_click)
+        self._browse_list.bind("<Return>", lambda _e: self._browse_play())
+        self._browse_list.bind("<space>", lambda _e: self._toggle_playback())
+        self._browse_list.bind(
+            "<Button-1>", lambda _e: setattr(self, "_active_music_source", "browse")
+        )
+
+    def _voice_preview_double_click(self, event) -> str:
+        if self._voice_preview_list is None:
+            return "break"
+        if event is not None:
+            index = self._voice_preview_list.nearest(event.y)
+        else:
+            selected = self._voice_preview_list.curselection()
+            index = int(selected[0]) if selected else -1
+        snap = self.ui_state.snapshot()
+        titles = snap.get("voice_previews", [])
+        urls = snap.get("voice_preview_urls", [])
+        if not 0 <= index < len(titles):
+            return "break"
+        self._voice_preview_list.selection_clear(0, "end")
+        self._voice_preview_list.selection_set(index)
+        self._active_music_source = "preview"
+        title = titles[index]
+        url = urls[index] if index < len(urls) else ""
+        if url and self.on_play_playlist:
+            track = {"title": title, "url": url}
+            _run_in_background("voice-preview-play", self.on_play_playlist, [track], 0)
+        elif self.on_play_query:
+            # Older saved UI state may contain titles without URLs. Re-run the
+            # exact voice query so double-click remains useful instead of being
+            # a silent no-op.
+            _run_in_background("voice-preview-search", self.on_play_query, title)
+        if self._browse_msg is not None:
+            self._browse_msg.set(f"Playing {title}")
+        return "break"
+
+    def _submit_browse(self) -> None:
+        text = self._search_var.get().strip() if self._search_var is not None else ""
+        if not text or self._on_browse_query is None:
+            return
+        self._browse_msg.set(f"Searching for “{text}”…")
+        _run_in_background("browse", self._on_browse_query, text)
+
+    def _browse_double_click(self, event) -> str:
+        if self._browse_list is not None and event is not None:
+            index = self._browse_list.nearest(event.y)
+            if 0 <= index < len(self._browse_results):
+                self._browse_list.selection_clear(0, "end")
+                self._browse_list.selection_set(index)
+        self._browse_play()
+        return "break"
+
+    def _browse_add_to_playlist(self) -> None:
+        selection = self._browse_list.curselection() if self._browse_list else ()
+        store = self._store()
+        name = self._pl_selected_name()
+        if not selection or store is None or name is None:
+            self._browse_msg.set("Select a song and a playlist first")
+            return
+        track = dict(self._browse_results[int(selection[0])])
+        try:
+            store.add(name, str(track.get("title") or "Unknown"), str(track.get("url") or ""))
+        except ValueError as exc:
+            self._browse_msg.set(f"could not add: {exc}")
+            return
+        self._pl_reload_tracks()
+        self._browse_msg.set(f"Added to {name}")
+
+    def _browse_play(self) -> None:
+        selection = self._browse_list.curselection() if self._browse_list else ()
+        if not selection or self.on_play_playlist is None:
+            return
+        self._active_music_source = "browse"
+        track = dict(self._browse_results[int(selection[0])])
+        _run_in_background("browse-play", self.on_play_playlist, [track], 0)
+        self._browse_msg.set(f"Playing {track.get('title', 'track')}")
+
+    def _refresh_browse(self, results: list[dict]) -> None:
+        if self._browse_list is None:
+            return
+        self._browse_results = [dict(result) for result in results]
+        self._browse_list.delete(0, "end")
+        for result in self._browse_results:
+            title = _truncate(str(result.get("title") or "Unknown"), 70)
+            duration = result.get("duration")
+            suffix = f"  ·  {_format_duration(duration)}" if duration else ""
+            self._browse_list.insert("end", f"{title}{suffix}")
+        if self._browse_msg is not None:
+            count = len(results)
+            self._browse_msg.set(
+                f"{count} result{'s' if count != 1 else ''} · double-click to play"
+                if count else "No music found · try another search"
+            )
 
     def _pl_note(self, text: str, error: bool = False) -> None:
         if self._pl_msg is not None:
@@ -872,9 +1394,15 @@ class Overlay(tk.Tk):
         store = self._store()
         name = self._pl_selected_name()
         self._pl_tracks = store.tracks(name) if store and name else []
-        for track in self._pl_tracks:
-            self._pl_list.insert("end",
-                                 _truncate(track.get("title", ""), POOL_MAX_CHARS))
+        for index, track in enumerate(self._pl_tracks, start=1):
+            self._pl_list.insert(
+                "end", f"{index}.  {_truncate(track.get('title', ''), POOL_MAX_CHARS)}"
+            )
+        if self._pl_var is not None:
+            count = len(self._pl_tracks)
+            unit = "track" if count == 1 else "tracks"
+            empty = " · no songs yet — browse or say youtube add" if count == 0 else ""
+            self._pl_note(f"{name or 'No playlist'} · {count} {unit}{empty}")
 
     def _pl_selected_index(self) -> int | None:
         if self._pl_list is None:
@@ -935,21 +1463,108 @@ class Overlay(tk.Tk):
         self._pl_note(f"deleted {name!r}")
 
     def _pl_play(self) -> None:
-        """C2: play the highlighted entry; failures never kill the overlay."""
+        """Play a saved playlist as the real shared queue, off the Tk thread."""
         index = self._pl_selected_index()
-        player = self.ui_state.player
-        if index is None or not self._pl_tracks or player is None:
+        if index is None or not self._pl_tracks:
             return
-        track = self._pl_tracks[index]
-        url = track.get("url") or ""
-        title = track.get("title") or url
+        if self.on_play_playlist is None:
+            self._pl_note("playlist playback is unavailable", error=True)
+            return
+        tracks = [dict(track) for track in self._pl_tracks]
+        title = tracks[index].get("title") or "track"
+        _run_in_background("playlist", self.on_play_playlist, tracks, index)
+        self._pl_note(f"loading {title!r}")
+
+    def _add_selected_music(self) -> None:
+        """Add the selected row from the active music surface to the playlist."""
+        store = self._store()
+        name = self._pl_selected_name()
+        if store is None or name is None:
+            self._pl_note("select a playlist first", error=True)
+            return
+
+        source, index = self._active_music_selection()
+        # Clicking a global Add button can move focus without changing the
+        # selection. If the explicit source was lost, recover the selected row
+        # from the three visible music surfaces instead of silently doing
+        # nothing.
+        if source is None or index is None:
+            if self._voice_preview_list is not None and self._voice_preview_list.curselection():
+                source, index = "preview", int(self._voice_preview_list.curselection()[0])
+            elif self._browse_list is not None and self._browse_list.curselection():
+                source, index = "browse", int(self._browse_list.curselection()[0])
+            elif self._pl_list is not None and self._pl_list.curselection():
+                source, index = "playlist", int(self._pl_list.curselection()[0])
+        if source is None or index is None:
+            self._pl_note("select a song first", error=True)
+            return
+        if source == "browse":
+            track = dict(self._browse_results[index])
+        elif source == "preview":
+            previews = self.ui_state.snapshot()
+            title = previews.get("voice_previews", [])[index]
+            urls = previews.get("voice_preview_urls", [])
+            track = {"title": title, "url": urls[index] if index < len(urls) else ""}
+        else:
+            track = dict(self._pl_tracks[index])
+        url = str(track.get("url") or "")
+        if not url:
+            self._pl_note("voice previews do not contain a playable URL; use Browse music", error=True)
+            return
         try:
-            player.command("playlist-clear", raise_on_error=False)
-            player.load(url, "replace")
-        except Exception as exc:
-            self._pl_note(f"could not play {title!r}: {exc}", error=True)
+            store.add(name, str(track.get("title") or url), url)
+        except ValueError as exc:
+            self._pl_note(str(exc), error=True)
             return
-        self._pl_note(f"playing {title!r}")
+        self._pl_reload_tracks()
+        self._pl_note(f"added {track.get('title') or url!r} to {name!r}")
+
+    def _sync_current_rows(self) -> None:
+        """Mark the real current track without changing user selection."""
+        player = self.ui_state.player
+        current_url = None
+        if player is not None:
+            try:
+                current_url = player.current_url()
+            except Exception:
+                current_url = None
+        self._current_url = current_url
+        if self._voice_preview_list is not None:
+            snap = self.ui_state.snapshot()
+            urls = snap.get("voice_preview_urls", [])
+            for index, url in enumerate(urls[:self._voice_preview_list.size()]):
+                marker = "▶ " if current_url and url == current_url else ""
+                self._voice_preview_list.itemconfig(
+                    index, fg=ACCENT if marker else FG
+                )
+        if self._browse_list is not None:
+            for index, track in enumerate(self._browse_results[:self._browse_list.size()]):
+                marker = "▶ " if current_url and track.get("url") == current_url else ""
+                self._browse_list.itemconfig(index, fg=ACCENT if marker else FG)
+        if self._pl_list is not None:
+            for index, track in enumerate(self._pl_tracks[:self._pl_list.size()]):
+                marker = "▶ " if current_url and track.get("url") == current_url else ""
+                self._pl_list.itemconfig(index, fg=ACCENT if marker else FG)
+
+    def _active_music_selection(self) -> tuple[str | None, int | None]:
+        """Return the row from the list the user most recently selected."""
+        source = self._active_music_source
+        if self._add_button is not None:
+            self._add_button.configure(text={
+                "browse": "Add Browse",
+                "preview": "Add Voice",
+                "playlist": "Add Track",
+            }.get(source, "Add"))
+        if source == "browse" and self._browse_list is not None:
+            selected = self._browse_list.curselection()
+            return ("browse", int(selected[0])) if selected else (None, None)
+        if source == "preview" and self._voice_preview_list is not None:
+            selected = self._voice_preview_list.curselection()
+            return ("preview", int(selected[0])) if selected else (None, None)
+        if source == "playlist" and self._pl_list is not None:
+            selected = self._pl_list.curselection()
+            return ("playlist", int(selected[0])) if selected else (None, None)
+        return None, None
 
     def _pl_add_current(self) -> None:
         store = self._store()
@@ -960,8 +1575,7 @@ class Overlay(tk.Tk):
             return
         title = player.current_title()
         try:
-            url = player.command("get_property", "path", timeout=2.0,
-                                 raise_on_error=False)
+            url = player.current_url()
         except Exception:
             url = None
         if not isinstance(url, str) or not url:
@@ -989,25 +1603,82 @@ class Overlay(tk.Tk):
         self._pl_reload_tracks()
         self._pl_note("removed one track")
 
-    def _pl_move(self, delta: int) -> None:
+    def _pl_move_key(self, delta: int) -> str:
+        index = self._pl_selected_index()
+        target = None if index is None else index + delta
+        if index is None or target is None or not 0 <= target < len(self._pl_tracks):
+            return "break"
         store = self._store()
         name = self._pl_selected_name()
-        index = self._pl_selected_index()
-        if store is None or name is None or index is None:
-            return
-        target = index + delta
+        if store is None or name is None:
+            return "break"
         try:
             store.reorder(name, index, target)
         except (ValueError, IndexError):
-            return      # already at the edge: not an error worth reporting
+            return "break"
+        self._pl_reload_tracks()
+        self._pl_list.selection_set(target)
+        return "break"
+
+    def _pl_drag_start(self, event) -> None:
+        self._pl_drag_origin_y = int(event.y)
+        self._pl_drag_index = self._pl_index_at(event.y)
+        self._active_music_source = "playlist"
+        if self._pl_drag_index is not None:
+            self._pl_drag_last = self._pl_drag_index
+            self._pl_list.selection_clear(0, "end")
+            self._pl_list.selection_set(self._pl_drag_index)
+            self._pl_list.activate(self._pl_drag_index)
+            self._pl_drag_hint.set(f"Moving track {self._pl_drag_index + 1}")
+
+    def _pl_drag_motion(self, event) -> None:
+        if self._pl_drag_index is None or self._pl_drag_origin_y is None:
+            return
+        if abs(int(event.y) - self._pl_drag_origin_y) < 5:
+            return
+        index = self._pl_index_at(event.y)
+        if index is None or index == self._pl_drag_last:
+            return
+        self._pl_drag_last = index
+        self._pl_list.selection_clear(0, "end")
+        self._pl_list.selection_set(index)
+        self._pl_list.activate(index)
+        self._pl_list.see(index)
+        self._pl_drag_hint.set(f"Drop at position {index + 1}")
+
+    def _pl_drag_end(self, _event) -> None:
+        source = self._pl_drag_index
+        target = self._pl_drag_last
+        moved = self._pl_drag_origin_y is not None and self._pl_drag_last is not None \
+            and self._pl_drag_last != source
+        self._pl_drag_index = None
+        self._pl_drag_last = None
+        self._pl_drag_origin_y = None
+        self._pl_drag_hint.set("")
+        if not moved or source is None or target is None or source == target:
+            return
+        store = self._store()
+        name = self._pl_selected_name()
+        if store is None or name is None:
+            return
+        try:
+            store.reorder(name, source, target)
+        except (ValueError, IndexError):
+            return
         self._pl_reload_tracks()
         if self._pl_list is not None:
             self._pl_list.selection_set(target)
 
+    def _pl_index_at(self, y: int) -> int | None:
+        if self._pl_list is None or not self._pl_tracks:
+            return None
+        index = self._pl_list.nearest(y)
+        return index if 0 <= index < len(self._pl_tracks) else None
+
     # -- D: settings tab ---------------------------------------------------
 
     def _build_settings_tab(self, parent: tk.Widget) -> None:
-        """D1/D2/E3/E4: a form over the live Config, saved back to YAML."""
+        """Settings uses themed cards while preserving the living Config form."""
         cfg = self.app_config
         if cfg is None:
             tk.Label(parent, text="no config file is attached to this run",
@@ -1024,6 +1695,9 @@ class Overlay(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         inner.bind("<Configure>", lambda _e: canvas.configure(
             scrollregion=canvas.bbox("all")))
+        inner.bind("<Control-s>", lambda _e: self._settings_save())
+        inner.bind("<Escape>", lambda _e: self._settings_reload())
+        inner.bind("<F6>", lambda _e: self._settings_focus_next())
 
         # E3: backend picker.  Restart to take effect (a loaded model cannot
         # be swapped under a running capture loop).
@@ -1075,6 +1749,9 @@ class Overlay(tk.Tk):
 
         ui = cfg.ui_config
         self._section(inner, "ui")
+        self._set_theme_var = tk.StringVar(value=ui.theme if ui else "midnight")
+        self._combo_row(inner, "theme", self._set_theme_var, list(theme_names()))
+        self._set_theme_var.trace_add("write", self._theme_selected)
         self._row(inner, "ui", "mode", ui.mode if ui else "compact", "str")
         self._row(inner, "ui", "overlay_width", ui.overlay_width if ui else 400, "int")
         self._row(inner, "ui", "overlay_height", ui.overlay_height if ui else 214, "int")
@@ -1085,18 +1762,85 @@ class Overlay(tk.Tk):
 
         self._build_commands_editor(inner)   # D2
         self._build_settings_actions(inner)  # D3/D4/E4
+        self._snapshot_settings_values()
+        for var in list(self._set_vars.values()):
+            var.trace_add("write", self._settings_changed)
+
+    def _snapshot_settings_values(self) -> None:
+        self._settings_loaded_values = {
+            key: var.get() for key, var in self._set_vars.items()
+        }
+        self._set_dirty = False
+
+    def _settings_changed(self, *_args) -> None:
+        dirty = any(
+            self._set_vars[key].get() != value
+            for key, value in self._settings_loaded_values.items()
+            if key in self._set_vars
+        )
+        self._set_dirty = dirty
+        if self._set_msg is not None:
+            self._settings_msg("Unsaved changes" if dirty else "No changes")
+
+    def _settings_focus_next(self) -> str:
+        focusables = []
+        for parent in self.winfo_children():
+            focusables.extend(parent.winfo_children())
+        for widget in focusables:
+            try:
+                if widget.winfo_takesfocus() and widget.winfo_ismapped():
+                    widget.focus_set()
+                    return "break"
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _theme_selected(self, *_args) -> None:
+        name = self._set_theme_var.get()
+        if name in theme_names() and name != self.theme_name:
+            self.theme_name = name
+            self._setup_theme()
+            self.configure(bg=BG)
+            self._apply_theme_to_tree(self)
+            self._show_page(self._active_page)
+            self._sync_current_rows()
+            self._settings_msg(f"theme preview: {name}; Save to keep it")
+
+    def _apply_theme_to_tree(self, widget) -> None:
+        try:
+            widget.configure(bg=BG)
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            try:
+                options = {}
+                for key in ("bg", "activebackground"):
+                    if key in child.keys():
+                        options[key] = BG if key == "bg" else (
+                            ACCENT_DIM if str(child.cget("bg")) == ACCENT else HOVER
+                        )
+                for key in ("fg", "activeforeground"):
+                    if key in child.keys():
+                        options[key] = FG if key == "fg" else (
+                            "#07130b" if str(child.cget("bg")) == ACCENT else FG
+                        )
+                if options: child.configure(**options)
+            except tk.TclError:
+                pass
+            self._apply_theme_to_tree(child)
 
     def _section(self, parent: tk.Widget, title: str) -> None:
-        tk.Label(parent, text=title, bg=BG, fg=FG,
-                 font=("Segoe UI", 10, "bold")).pack(
-                     fill="x", padx=6, pady=(10, 2), anchor="w")
+        header = tk.Frame(parent, bg=SURFACE, padx=8, pady=5)
+        header.pack(fill="x", padx=6, pady=(10, 2))
+        tk.Label(header, text=title.upper(), bg=SURFACE, fg=FG,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
 
     def _row(self, parent: tk.Widget, section: str, key: str, value,
              kind: str) -> None:
         """One labelled field; registers its variable for collection on save."""
-        line = tk.Frame(parent, bg=BG)
-        line.pack(fill="x", padx=6, pady=1)
-        tk.Label(line, text=key, bg=BG, fg=FG_DIM, width=34, anchor="w",
+        line = tk.Frame(parent, bg=BG, padx=6, pady=1)
+        line.pack(fill="x", padx=6)
+        tk.Label(line, text=key.replace("_", " "), bg=BG, fg=FG_DIM, width=34, anchor="w",
                  font=("Segoe UI", 9)).pack(side="left")
         if kind == "bool":
             var: tk.Variable = tk.BooleanVar(value=bool(value))
@@ -1127,8 +1871,8 @@ class Overlay(tk.Tk):
         text = label + (" (restart)" if restart else "")
         tk.Label(line, text=text, bg=BG, fg=FG_DIM, width=34, anchor="w",
                  font=("Segoe UI", 9)).pack(side="left")
-        ttk.Combobox(line, textvariable=var, values=choices, width=28).pack(
-            side="left")
+        ttk.Combobox(line, textvariable=var, values=choices, width=30,
+                     style="Modern.TCombobox").pack(side="left", ipady=2)
 
     def _build_commands_editor(self, parent: tk.Widget) -> None:
         """D2: one row per action - editable verbs + takes_query."""
@@ -1171,8 +1915,11 @@ class Overlay(tk.Tk):
                               ("Copy diagnostics", self._settings_diagnostics),
                               ("Desktop shortcut", self._settings_shortcut),
                               ("Auto-start", self._settings_autostart)):
-            tk.Button(row, text=text, command=command).pack(
-                side="left", padx=(0, 6))
+            primary = text == "Save"
+            tk.Button(row, text=text, bg=ACCENT if primary else SURFACE_ALT,
+                      fg="#07130b" if primary else FG, activebackground=ACCENT_DIM,
+                      relief="flat", bd=0, command=command).pack(
+                          side="left", padx=(0, 6))
         self._set_msg = tk.StringVar(value="")
         tk.Label(parent, textvariable=self._set_msg, bg=BG, fg=FG_DIM,
                  justify="left", anchor="w", wraplength=640,
@@ -1208,6 +1955,8 @@ class Overlay(tk.Tk):
         if self._set_mic_var is not None:
             index = _mic_index(self._set_mic_var.get(), self._set_mics)
             sections.setdefault("audio", {})["device"] = index
+        if self._set_theme_var is not None:
+            sections.setdefault("ui", {})["theme"] = self._set_theme_var.get()
         return sections
 
     def _collect_commands(self) -> list[dict]:
@@ -1231,10 +1980,16 @@ class Overlay(tk.Tk):
                         f"commands: verb {verb!r} is used by both "
                         f"{seen_verbs[verb]} and {action}")
                 seen_verbs[verb] = action
+            takes_query = bool(query_var.get())
+            if takes_query and action != "play":
+                # Same rule as config._build: one query slot, one search path.
+                # The save refuses instead of writing a file that bricks voice.
+                raise ValueError(
+                    f"commands.{action}: takes_query may only be true for 'play'")
             specs.append({
                 "action": action,
                 "verbs": verbs,
-                "takes_query": bool(query_var.get()),
+                "takes_query": takes_query,
             })
         unknown = [s["action"] for s in specs if s["action"] not in known_actions()]
         if unknown:
@@ -1268,14 +2023,16 @@ class Overlay(tk.Tk):
         except Exception as exc:
             if backup is not None:
                 try:
-                    path.write_text(backup, encoding="utf-8")
+                    atomic_write_text(path, backup)
                 except OSError:
                     LOGGER.exception("could not restore %s", path)
             self._settings_msg(f"not saved - {exc}")
             return
         self._settings_msg(
-            f"saved to {path} - restart the daemon for voice-command, "
+            f"saved to {path} - theme applied live; restart the daemon for voice-command, "
             "backend and microphone changes")
+        self._snapshot_settings_values()
+        self._set_dirty = False
 
     def _settings_reload(self) -> None:
         """D3: re-read the file into the form (discards unsaved edits)."""
@@ -1297,6 +2054,8 @@ class Overlay(tk.Tk):
                 var.set(bool(value))
             else:
                 var.set(", ".join(value) if isinstance(value, list) else str(value))
+        if self._set_theme_var is not None:
+            self._set_theme_var.set(str((doc.get("ui") or {}).get("theme", "midnight")))
         if self._set_backend_var is not None:
             self._set_backend_var.set(str((doc.get("asr") or {}).get(
                 "backend", cfg.asr.backend)))
@@ -1310,6 +2069,7 @@ class Overlay(tk.Tk):
             pair[0].set(", ".join(spec.get("verbs") or []))
             pair[1].set(bool(spec.get("takes_query")))
         self._settings_msg("reloaded from disk")
+        self._snapshot_settings_values()
 
     # -- D4/E4: diagnostics, shortcut, autostart ----------------------------
 
@@ -1393,19 +2153,120 @@ class Overlay(tk.Tk):
 
     # -- events ----------------------------------------------------------
 
-    def _on_volume_release(self, _event) -> None:
-        """B4: slider drag finished -> set_volume() once, then resume polling."""
-        self._volume_dragging = False
+    def _ui_step_volume(self, delta: float) -> None:
+        player = self.ui_state.player
+        if player is None:
+            return
+        current = float(self.ui_state.snapshot().get("volume", 50))
+        target = max(0.0, min(130.0, current + float(delta)))
+        self.ui_state.set_volume(int(round(target)))
+        if self._vol_label is not None:
+            self._vol_label.set(f"{target:.0f}%")
+        try:
+            applied = player.set_volume(target)
+            self.ui_state.set_volume(int(round(applied)))
+            if self._vol_label is not None:
+                self._vol_label.set(f"{applied:.0f}%")
+        except Exception as exc:
+            self.ui_state.set_error(f"player: {exc}")
+
+    def _set_volume_local(self, value: float) -> str:
         if self._vol_var is not None:
-            _player_set_volume(self.ui_state.player, self.ui_state,
-                               self._vol_var.get())
+            self._vol_var.set(value)
+            self._vol_label.set(f"{value:.0f}%")
+        return "break"
+
+    def _nudge_volume(self, delta: float) -> str:
+        value = float(self._vol_var.get() or 0) if self._vol_var is not None else 0.0
+        return self._set_volume_local(max(0.0, min(130.0, value + delta)))
+
+    def _on_volume_wheel(self, event) -> str:
+        step = getattr(self.ui_state.player, "volume_step", 10)
+        return self._nudge_volume(step if event.delta > 0 else -step)
+
+    def _on_volume_wheel_and_commit(self, event) -> str:
+        self._on_volume_wheel(event)
+        return self._commit_local_volume()
+
+    def _commit_local_volume(self, _event=None) -> str:
+        """Commit keyboard/wheel changes immediately with a plain float."""
+        value = float(self._vol_var.get() or 0) if self._vol_var is not None else 0.0
+        _run_in_background(
+            "volume-keyboard", _player_set_volume,
+            self.ui_state.player, self.ui_state, value,
+        )
+        return "break"
+
+    @staticmethod
+    def _toggle_playback(self) -> str:
+        _run_in_background(
+            "transport", _player_transport,
+            self.ui_state.player, self.ui_state, "play_pause",
+        )
+        return "break"
+
+    def _format_time(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def _seek_percent_from_event(self, event) -> float:
+        width = max(1, self._seek_scale.winfo_width())
+        return max(0.0, min(100.0, float(event.x) * 100.0 / width))
+
+    def _draw_seek(self) -> None:
+        if self._seek_scale is None or self._seek_var is None:
+            return
+        width = max(1, self._seek_scale.winfo_width())
+        percent = max(0.0, min(100.0, float(self._seek_var.get())))
+        x = width * percent / 100.0
+        self._seek_scale.coords(self._seek_track_id, 0, 8, width, 11)
+        self._seek_scale.coords(self._seek_fill_id, 0, 8, x, 11)
+        self._seek_scale.coords(self._seek_handle_id, x - 7, 4, x + 7, 18)
+
+    def _on_seek_press(self, event) -> str:
+        self._seek_dragging = True
+        self._seek_var.set(self._seek_percent_from_event(event))
+        self._draw_seek()
+        return "break"
+
+    def _on_seek_motion(self, event) -> str:
+        self._seek_var.set(self._seek_percent_from_event(event))
+        self._draw_seek()
+        if self._seek_duration and self._seek_label is not None:
+            self._seek_label.set(
+                f"{self._format_time(self._seek_var.get() / 100 * self._seek_duration)} / "
+                f"{self._format_time(self._seek_duration)}"
+            )
+        return "break"
+
+    def _on_seek_release(self, _event) -> str:
+        self._seek_dragging = False
+        if self._seek_duration:
+            seconds = max(0.0, min(self._seek_duration, self._seek_var.get() / 100 * self._seek_duration))
+            self._seek_last_committed = seconds
+            _run_in_background("seek", lambda p, s: p.seek(s), self.ui_state.player, seconds)
+        return "break"
+
+    def _on_volume_press(self, _event) -> None:
+        self._volume_dragging = True
+        self._on_volume_motion(_event)
+
+    def _on_volume_motion(self, _event) -> None:
+        self._volume_dragging = True
+        if self._vol_var is not None:
+            self._vol_label.set(f"{self._vol_var.get():.0f}%")
+
+    def _on_volume_release(self, _event) -> None:
+        """Capture on Tk thread, then commit a plain float on a worker."""
+        self._volume_dragging = False
+        value = float(self._vol_var.get()) if self._vol_var is not None else 50.0
+        _run_in_background(
+            "volume-set", _player_set_volume,
+            self.ui_state.player, self.ui_state, value,
+        )
 
     def _on_mute_toggle(self) -> None:
-        """B4: mute -> 0, again -> the volume from before the mute.
-
-        mpv has no mute flag the daemon tracks, so mute is just volume 0
-        with the previous level remembered on the overlay.
-        """
+        """Read the current volume on Tk's thread, then mute in the worker."""
         player = self.ui_state.player
         if player is None:
             return
@@ -1415,14 +2276,15 @@ class Overlay(tk.Tk):
             LOGGER.warning("player volume read failed: %s", exc)
             self.ui_state.set_error(f"player: {exc}")
             return
+        previous = self._mute_before
         if current > 0:
             self._mute_before = current
-            _player_set_volume(player, self.ui_state, 0.0)
-            self.ui_state.set_action("muted")
+            target = 0.0
         else:
-            _player_set_volume(player, self.ui_state,
-                               self._mute_before if self._mute_before else 50.0)
-            self.ui_state.set_action("unmuted")
+            target = previous if previous is not None else 50.0
+        _run_in_background(
+            "mute", _player_toggle_mute, player, self.ui_state, target
+        )
 
     def _on_list_select(self, _event) -> None:
         """B5: listbox row -> same handler the compact pool rows use."""
@@ -1451,13 +2313,9 @@ class Overlay(tk.Tk):
         text = (text or "").strip()
         if not text or self.on_play_query is None:
             return
-        try:
-            self.on_play_query(text)
-        except Exception:  # the daemon owns failures; the overlay must not die
-            LOGGER.exception("play-from-ui handler failed")
-            return
         if self._search_var is not None:
             self._search_var.set("")
+        _run_in_background("search", self.on_play_query, text)
 
     def _refresh_recent(self, recent: list[str]) -> None:
         """E1: repaint the strip only when the list actually changed."""
@@ -1525,6 +2383,17 @@ class Overlay(tk.Tk):
                 pass
         self._cheat_window = None
 
+    def _close_app(self) -> None:
+        """Request shutdown without blocking Tk while PortAudio closes."""
+        self.ui_state.shutdown.set()
+        if self._on_quit is not None:
+            threading.Thread(
+                target=self._on_quit,
+                name="voiceyt-ui-shutdown",
+                daemon=True,
+            ).start()
+        self.quit()
+
     def _drag_start(self, event) -> None:
         self._drag_xy = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
         self._drag_moved = False
@@ -1549,7 +2418,6 @@ class Overlay(tk.Tk):
         if self._hidden:
             self.deiconify()
             self._hidden = False
-        self.attributes("-alpha", 1.0)
         self.lift()
 
     # -- polling ---------------------------------------------------------
@@ -1580,9 +2448,10 @@ class Overlay(tk.Tk):
         # --- mic level meter ---
         capture = self.ui_state.capture
         level = capture.level if capture is not None else 0.0
-        frac = min(1.0, level / LEVEL_FULL)
-        self._meter_frac += 0.35 * (frac - self._meter_frac)   # smooth
-        width = int((self._win_width - 28) * self._meter_frac)
+        frac = min(1.0, max(0.0, (float(level) - 0.001) / (LEVEL_FULL - 0.001)))
+        self._meter_frac += 0.55 * (frac - self._meter_frac)   # fast, visible response
+        meter_width = max(1, self._meter.winfo_width())
+        width = int(meter_width * self._meter_frac)
         self._meter.coords(self._meter_id, 0, 0, width, 4)
         self._meter.itemconfig(
             self._meter_id, fill=DOT_BUSY if level > LEVEL_SPEAK else DOT_IDLE
@@ -1598,23 +2467,48 @@ class Overlay(tk.Tk):
             self._heard_label.configure(fg=FG)
             self.show()
 
+        if self._meter_frac > 0.02:
+            self._heard_label.configure(fg=ACCENT)
+
         # --- status line: last action, then what is playing ---
         self._action_var.set(self._status_line(snap, action_age))
 
         # --- result pool (compact labels) + B5 expanded listbox ---
         titles = self._pool_titles()
-        for index, label in enumerate(self._pool_labels):
-            if index < len(titles):
-                text = _truncate(titles[index], POOL_MAX_CHARS)
-                label.configure(text=f"{index + 1}. {text}", fg=FG)
-            else:
-                label.configure(text="", fg=FG_DIM)
+        if self.expanded and self._voice_preview_list is not None:
+            if titles != self._player_titles:
+                self._player_titles = list(titles)
+                selected = self._voice_preview_list.curselection()
+                self._voice_preview_list.delete(0, "end")
+                for pos, title in enumerate(titles, start=1):
+                    self._voice_preview_list.insert(
+                        "end", f"{pos}. {_truncate(title, POOL_MAX_CHARS)}"
+                    )
+                if selected and selected[0] < len(titles):
+                    self._voice_preview_list.selection_set(selected[0])
+        else:
+            for index, label in enumerate(self._pool_labels):
+                if index < len(titles):
+                    text = _truncate(titles[index], POOL_MAX_CHARS)
+                    label.configure(text=f"{index + 1}. {text}", fg=FG)
+                else:
+                    label.configure(text="", fg=FG_DIM)
 
         if self.expanded:
             # B2: now-playing line reuses _now_playing() verbatim (no new player
             # code) instead of rebuilding the title/position/volume string.
             if self._now_var is not None:
-                self._now_var.set(self._now_playing() or "nothing playing")
+                self._now_var.set(self._now_playing() or "Nothing playing")
+            if self._queue_var is not None:
+                try:
+                    queue = self.ui_state.player.pool_titles() if self.ui_state.player else []
+                    position = self.ui_state.player.current_position() if self.ui_state.player else None
+                    self._queue_var.set(
+                        f"Next: {queue[position + 1]}" if queue and position is not None and position + 1 < len(queue)
+                        else f"Queue: {len(queue)} track{'s' if len(queue) != 1 else ''}"
+                    )
+                except Exception:
+                    self._queue_var.set("Queue unavailable")
             # B5: keep the scrolling list in step with the compact rows.
             if self._player_list is not None and titles != self._player_titles:
                 self._player_titles = list(titles)
@@ -1625,6 +2519,32 @@ class Overlay(tk.Tk):
                         "end", f"{pos}. {_truncate(title, POOL_MAX_CHARS)}")
                 if selected and selected[0] < len(titles):
                     self._player_list.select_set(selected[0])
+            # Highlight the real mpv queue position; selection itself remains
+            # the user's next jump target, so automatic sync never loops playback.
+            queried = self._tick % PLAYER_POLL_EVERY == 0
+            try:
+                current = (
+                    self.ui_state.player.current_position()
+                    if queried and self.ui_state.player
+                    else None
+                )
+            except Exception:
+                current = None
+            if self._player_list is not None and queried and len(self._player_list.bbox("end")) >= 0:
+                for pos in range(len(titles)):
+                    marker = "▶" if pos == current else ""
+                    self._player_list.itemconfig(
+                        pos, fg=ACCENT if pos == current else FG,
+                        text=(f"{marker} {pos + 1}. " if marker else f"{pos + 1}. ")
+                             + _truncate(titles[pos], POOL_MAX_CHARS),
+                    )
+            if queried:
+                self._sync_playlist_highlight()
+                self._sync_current_rows()
+            if self._play_pause_button is not None:
+                self._play_pause_button.configure(
+                    text="⏸" if self._playing_now() else "▶"
+                )
             # B4: volume polling is decimated (every PLAYER_POLL_EVERY ticks)
             # so mpv IPC stays off the 250 ms hot path; never fight a drag.
             self._tick += 1
@@ -1640,11 +2560,33 @@ class Overlay(tk.Tk):
                     except Exception:
                         pass  # mpv restarting: keep the last slider position
             # B6: mic + backend + mpv + AEC, same tick, no new threads.
+            if queried and self.ui_state.player is not None:
+                try:
+                    current_seconds, duration = self.ui_state.player.playback_position()
+                    self._seek_duration = duration
+                    if not self._seek_dragging and self._seek_var is not None:
+                        self._seek_var.set(
+                            current_seconds / duration * 100 if duration else 0.0
+                        )
+                        self._draw_seek()
+                    if self._seek_label is not None:
+                        if duration and self._seek_last_committed is not None:
+                            if abs(current_seconds - self._seek_last_committed) > 1.0:
+                                self._seek_last_committed = None
+                        self._seek_label.set(
+                            f"{self._format_time(current_seconds)} / "
+                            f"{self._format_time(duration) if duration else '--:--'}"
+                        )
+                except Exception:
+                    pass
             if self._status_var is not None:
                 self._status_var.set(
                     _player_status_line(self.ui_state.player, self.ui_state, snap))
             # E1: repaint the recent strip only when its list changed.
             self._refresh_recent(snap.get("recent") or [])
+            if snap.get("search_results_ts", 0) != self._browse_results_ts:
+                self._browse_results_ts = snap.get("search_results_ts", 0)
+                self._refresh_browse(snap.get("search_results") or [])
 
         # --- ui.hide_while_playing: tuck the window away while the music runs ---
         if self._hide_while_playing:
@@ -1657,17 +2599,15 @@ class Overlay(tk.Tk):
                 self._hidden_for_playback = False
                 self.show()
 
-        # --- dim, then hide, once nothing happens for a while ---
+        # The overlay stays fully opaque. It may still hide when configured,
+        # but it never fades or changes window alpha.
         busy = max(snap["heard_ts"] if snap["heard"] else 0.0, snap["action_ts"], snap["error_ts"])
         if busy:
-            quiet = now - busy
-            if quiet > self._hide_after_s and not self._hidden:
+            if now - busy > self._hide_after_s and not self._hidden:
                 self.withdraw()
                 self._hidden = True
-            elif quiet <= self._hide_after_s:
-                self.attributes("-alpha", FADE_ALPHA if quiet > self._fade_after_s else 1.0)
         elif now - self._born > self._hide_after_s and not self._hidden:
-            self.withdraw()                  # idle since startup: hide too
+            self.withdraw()
             self._hidden = True
 
         self.after(POLL_MS, self._poll_ui)
@@ -1712,6 +2652,11 @@ class Overlay(tk.Tk):
             return ""
 
     def _pool_titles(self) -> list[str]:
+        # Voice previews are deliberately separate from the player queue. A
+        # playlist click replaces the queue, but must not alter the five rows
+        # shown under the voice header.
+        if self.expanded:
+            return list(self.ui_state.snapshot().get("voice_previews") or [])
         player = self.ui_state.player
         if player is None:
             return []
@@ -1725,7 +2670,8 @@ class Overlay(tk.Tk):
         if player is None:
             return False
         try:
-            return bool(player.playing)
+            checker = getattr(player, "is_playing", None)
+            return bool(checker() if callable(checker) else player.playing)
         except Exception:  # mpv may be restarting; assume idle
             return False
 
@@ -2045,10 +2991,15 @@ class Tray:
 
 
 def _overlay_mainloop(state: UiState, config, on_pool_click,
-                      app_config=None, on_play_query=None) -> None:
+                      app_config=None, on_play_query=None,
+                      on_play_playlist=None, on_browse_query=None,
+                      on_quit=None) -> None:
     """Own the tkinter thread: build the window, run it, tear it down."""
     try:
-        overlay = Overlay(state, config, on_pool_click, app_config, on_play_query)
+        overlay = Overlay(
+            state, config, on_pool_click, app_config, on_play_query,
+            on_play_playlist, on_browse_query, on_quit,
+        )
     except Exception:
         LOGGER.exception("cannot create the overlay window")
         return
@@ -2061,6 +3012,8 @@ def _overlay_mainloop(state: UiState, config, on_pool_click,
             overlay.destroy()
         except Exception:
             LOGGER.debug("overlay destroy failed", exc_info=True)
+        finally:
+            state.overlay_done.set()
 
 
 def start_ui(
@@ -2073,6 +3026,8 @@ def start_ui(
     on_quit=None,
     app_config=None,
     on_play_query=None,
+    on_play_playlist=None,
+    on_browse_query=None,
 ) -> "Tray | None":
     """Start the overlay and the tray icon in their own threads.
 
@@ -2101,7 +3056,10 @@ def start_ui(
 
     threading.Thread(
         target=_overlay_mainloop,
-        args=(state, config, on_pool_click, app_config, on_play_query),
+        args=(
+            state, config, on_pool_click, app_config, on_play_query,
+            on_play_playlist, on_browse_query, on_quit,
+        ),
         name="voiceyt-overlay",
         daemon=True,
     ).start()

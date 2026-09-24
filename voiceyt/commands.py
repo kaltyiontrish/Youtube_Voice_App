@@ -9,13 +9,15 @@ and adding a new *action* is one small function in this module.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Callable
 
 from .config import Config, ConfigError
 from .matcher import Command
 from .player import MpvPlayer, PlayerError
-from .search import SearchError, Searcher
+from .playlists import PlaylistStore
+from .search import SearchError, SearchResult, Searcher
 
 LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +67,12 @@ class CommandRunner:
         self.last_play_started: float | None = None
         self.last_query: str = ""
         self.last_results: tuple[str, ...] = ()
+        self.last_result_objects: tuple[SearchResult, ...] = ()
+        playlist_path = getattr(getattr(config, "player", None), "playlist_path", None)
+        self.playlist_store = (
+            PlaylistStore(playlist_path) if playlist_path is not None else None
+        )
+        self._dispatch_lock = threading.Lock()
 
     # -- guards ---------------------------------------------------------- #
 
@@ -84,8 +92,43 @@ class CommandRunner:
 
     # -- dispatch -------------------------------------------------------- #
 
+    def _playlist_name(self, query: str) -> str | None:
+        store = self.playlist_store
+        if store is None:
+            return None
+        if query.strip():
+            return query.strip() if query.strip() in store.names() else None
+        names = store.names()
+        return names[0] if names else None
+
+    def _playlist_results(self, name: str) -> list[SearchResult]:
+        return [
+            SearchResult(
+                video_id=str(track.get("url", "")).rsplit("=", 1)[-1],
+                title=str(track.get("title") or track.get("url") or "Unknown track"),
+                url=str(track["url"]),
+                duration=track.get("duration"),
+            )
+            for track in self.playlist_store.tracks(name)  # type: ignore[union-attr]
+            if track.get("url")
+        ]
+
+    def play_playlist(self, results: list, start_index: int) -> bool:
+        """Serialize saved-playlist replacement with voice and UI commands."""
+        with self._dispatch_lock:
+            if not self.player.alive:
+                self.player.close()
+                self.player.start()
+            self.player.play_results(results, self.searcher, start_index=start_index)
+            self.last_play_started = time.monotonic()
+        return True
+
     def dispatch(self, command: Command) -> bool:
-        """Run the handler for *command*; returns True when it did something."""
+        """Run one handler; voice and UI callers cannot race through yt-dlp/mpv."""
+        with self._dispatch_lock:
+            return self._dispatch_locked(command)
+
+    def _dispatch_locked(self, command: Command) -> bool:
         now = time.monotonic()
         if self._within_play_guard(now):
             LOGGER.info(
@@ -118,13 +161,28 @@ class CommandRunner:
             return False
 
 
+def _play_playlist_position(runner: CommandRunner, query: str) -> bool:
+    """Start the saved playlist at a 1-based position."""
+    if not query.isdigit():
+        return False
+    name = runner._playlist_name("")
+    results = runner._playlist_results(name) if name else []
+    index = int(query) - 1
+    if not 0 <= index < len(results):
+        LOGGER.info("playlist position %s is out of range", query)
+        return False
+    runner._ensure_player()
+    runner.player.play_results(results, runner.searcher, start_index=index)
+    runner.last_play_started = time.monotonic()
+    return True
+
+
 @handler("play")
 def _play(runner: CommandRunner, command: Command) -> bool:
     """Search YouTube and play the first hit, queueing the rest."""
     query = command.query.strip()
-    if not query:
-        LOGGER.info("play without a query: nothing to search for")
-        return False
+    if query.isdigit():
+        return _play_playlist_position(runner, query)
     runner._ensure_player()
     results = runner.searcher.search(query)
     if not results:
@@ -134,12 +192,44 @@ def _play(runner: CommandRunner, command: Command) -> bool:
     runner.last_play_started = time.monotonic()
     runner.last_query = query
     runner.last_results = tuple(result.title for result in results)
+    runner.last_result_objects = tuple(results)
     LOGGER.info(
         "playing %r (1 of %d): %s",
         query,
         len(results),
         "; ".join(f"{index + 1}. {title}" for index, title in enumerate(runner.last_results)),
     )
+    return True
+
+
+@handler("jump")
+def _jump(runner: CommandRunner, command: Command) -> bool:
+    """Jump to a 1-based track position in the selected playlist."""
+    return _play_playlist_position(runner, command.query.strip())
+
+
+@handler("add")
+def _add(runner: CommandRunner, command: Command) -> bool:
+    name = runner._playlist_name(command.query)
+    url = runner.player.current_url()
+    title = runner.player.current_title()
+    if name is None or not url:
+        return False
+    runner.playlist_store.add(name, title or url, url)  # type: ignore[union-attr]
+    return True
+
+
+@handler("remove")
+def _remove(runner: CommandRunner, command: Command) -> bool:
+    name = runner._playlist_name(command.query)
+    if name is None:
+        return False
+    url = runner.player.current_url()
+    tracks = runner.playlist_store.tracks(name)  # type: ignore[union-attr]
+    index = next((i for i, track in enumerate(tracks) if track.get("url") == url), -1)
+    if index < 0:
+        return False
+    runner.playlist_store.remove(name, index)  # type: ignore[union-attr]
     return True
 
 
@@ -158,6 +248,12 @@ def _prev(runner: CommandRunner, command: Command) -> bool:
 @handler("stop")
 def _stop(runner: CommandRunner, command: Command) -> bool:
     return runner.player.stop()
+
+
+@handler("pause")
+def _pause(runner: CommandRunner, command: Command) -> bool:
+    runner._ensure_player()
+    return runner.player.pause()
 
 
 @handler("resume")

@@ -18,6 +18,7 @@ COMMANDS = (
     ),
     CommandSpec(action="prev", verbs=("anterior", "volta"), takes_query=False),
     CommandSpec(action="stop", verbs=("para", "pausa", "chega"), takes_query=False),
+    CommandSpec(action="jump", verbs=("jump", "salta para"), takes_query=True),
     CommandSpec(
         action="volume_up", verbs=("mais alto", "aumenta", "sobe o som"), takes_query=False
     ),
@@ -80,7 +81,11 @@ class SingleUtteranceTests(unittest.TestCase):
         self.assertEqual(commands[0].action, "play")
         self.assertEqual(commands[0].query, "nirvana smells like teen spirit")
 
-    def test_query_is_normalized(self) -> None:
+    def test_jump_to_playlist_position(self) -> None:
+        commands = make_matcher().feed("youtube jump 3", 0.0)
+        self.assertEqual(commands[0].action, "jump")
+        self.assertEqual(commands[0].query, "3")
+
         commands = make_matcher().feed("youtube toca Análise Fúria", 0.0)
         self.assertEqual(commands[0].query, "analise furia")
 

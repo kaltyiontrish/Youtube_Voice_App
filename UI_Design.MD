@@ -158,3 +158,149 @@ Reuse everything below — the ladder says it already exists:
   action rejected via `validate_actions()`; verb lowercasing preserved.
 - Manual accept per tab in B7/C4/D5; keep `logs/test_all.txt` convention
   (append the run output).
+
+## 5. Modern player revamp (approved 2026-09-23)
+
+This section supersedes the dated top-notebook/form appearance in sections 1–4 while
+keeping their daemon, command, config, and compact-overlay work intact.
+
+### Product model
+
+The expanded window is one desktop music player, not three independent forms. Voice
+search, typed search, recent searches, and saved playlists all feed the same ordered
+mpv queue. A track has a stable display title and a canonical source URL; temporary
+resolved stream URLs are playback details and are never persisted.
+
+Interaction patterns follow familiar desktop players (persistent transport, visible
+queue, active-row highlighting, library sidebar), but the implementation and visual
+assets remain original and stdlib-only.
+
+### Target layout
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ voice status / transcript / live mic meter                              │
+├──────────────┬───────────────────────────────────────────────────────────┤
+│ Playlists    │ Browse results + saved playlists + shared queue           │
+│ Settings     │ Browse search is explicit; double-click starts playback   │
+├──────────────┴───────────────────────────────────────────────────────────┤
+│ persistent mini status: backend · mpv · mic · error                      │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- `compact` stays a lightweight 400×214 voice/status overlay.
+- `expanded` uses a dark sidebar instead of a top `ttk.Notebook`.
+- Primary colour is restrained green; elevated panels use charcoal surfaces.
+- Segoe UI Variable/Segoe UI, flat controls, clear hover/selected states.
+- Native Tk/ttk is sufficient; no Electron, web server, image assets, or new GUI lib.
+
+### Revamp checklist
+
+- [x] R1 Stable queue metadata: ordered titles + canonical URLs are installed
+  before preloading; failed/stale preloads cannot corrupt the mapping.
+- [x] R2 `play_results(..., start_index)` starts a whole saved playlist at the
+  selected track while preserving continuous next/previous playback.
+- [x] R3 Daemon callback `_ui_play_playlist` converts saved tracks to the shared
+  queue path; the UI no longer calls `player.load(url, "replace")` directly.
+- [x] R4 Add-current persists `MpvPlayer.current_url()` (watch URL), never mpv's
+  resolved googlevideo `path`.
+- [x] R5 Volume control uses explicit −/+ buttons and Mute; the bottom horizontal
+  slider is reserved for 0–100% song position and is draggable without window drag.
+  Volume clicks update the displayed value immediately and commit mpv asynchronously.
+- [x] R6 Player Play/Pause controls mpv playback, not the microphone/listener. The
+  persistent button swaps Play/Pause from the live player state; Stop remembers the
+  current track position, and Continue resumes it instead of restarting at zero.
+- [x] R7 Modern expanded shell: sidebar page registry, charcoal surfaces, green
+  accent, compact icon transport, and active navigation state.
+- [x] R8 Saved playlists and shared queue expose the same active canonical URL;
+  UI polling highlights the current row.
+- [x] R9 Persistent bottom mini-player controls keep transport and volume available
+  on Playlists and Settings without duplicating command logic.
+- [x] R10 Playlist page has themed controls, numbered rows, track counts, loading
+  feedback, a right-side scrollbar beside the track list, and canonical active-row
+  highlighting without playback side effects. Tracks reorder by drag-and-drop;
+  Move up/down buttons are not used.
+- [x] R11 Settings uses elevated section headers, readable labels, a green primary
+  Save action, and the existing validated atomic save/rollback flow.
+- [x] R12 Keyboard/mouse-wheel volume controls and a click-drag playback seek bar
+  are complete, with IPC committed off the Tk event thread.
+- [ ] R13 Add context actions: Play next / Add to queue / Add search result to a
+  chosen playlist. Defer drag-sort UI until button reorder is manually accepted.
+- [ ] R14 Update tests from notebook tabs to sidebar pages, then run the full
+  suite plus a Windows manual acceptance pass at 100%, 125%, and 150% scaling.
+
+- [x] R15 The Player navigation page is removed. One Playlists workspace owns
+  browse results, saved playlists, voice previews, and the shared active queue;
+  persistent transport/volume remain global.
+- [x] R16 Expanded voice header always renders heard text, a live gain meter, and
+  the five voice-command previews directly below the meter.
+- [x] R17 Browse search lists up to 10 music results with a scrollbar and never starts
+  playback; double-click explicitly plays the selected result through the shared queue.
+  It does not replace the five voice-preview rows.
+- [x] R18 Playlist and Settings comboboxes use the modern shared ttk theme.
+- [x] R19 Voice `add`/`remove` operate on the current canonical track and the first
+  configured playlist; numeric `youtube play N` plays playlist position N (1-based).
+- [x] R20 Volume, browse query/results, voice previews, and recent queries persist in
+  `logs/ui_state.json`; the X button requests full daemon shutdown.
+- [x] R21 The three music surfaces are explicitly scoped: voice previews at the
+  top, Browse Music in the Playlists page, and saved tracks in the playlist list.
+  Generic Add uses the most recently selected surface instead of guessing.
+- [x] R22 Playlist drag-and-drop has a movement threshold, a visible drop hint,
+  and initializes drag state explicitly, so a normal click is not treated as a
+  reorder.
+- [x] R23 The persistent Play/Pause button uses authoritative mpv state after
+  seek transitions, avoiding the previous two-click behavior.
+- [x] R24 The song-position bar owns its gesture bindings; the header drag region
+  does not intercept the slider.
+- [x] R25 The persistent bar exposes Now Playing and the next queued track.
+- [x] R26 All three music lists support Return/Space shortcuts, and list focus has
+  visible focus styling.
+- [x] R27 Empty Browse and playlist states explain the next action.
+- [x] R28 Queue and playback state remain separate from the user's last selection;
+  selection never implicitly starts playback.
+- [x] R29 The Add button identifies the active source (Browse, Voice, or Track).
+- [x] R30 Current playback is marked in all three music lists without changing
+  the user's selected row.
+- [x] R31 Playlist keyboard reordering, Delete, and Ctrl+A are available in
+  addition to drag-and-drop.
+
+### Settings and theme work
+
+- [x] T1 Added five semantic themes: Midnight, Ocean, Ember, Mono, and Rose.
+- [x] T2 Added validated `ui.theme` configuration with Midnight default and
+  safe fallback behavior.
+- [x] T3 Added live theme selection from Settings with recursive widget refresh.
+- [x] T4 Added theme palette/configuration tests and kept the full suite green.
+- [x] T5 Added Settings dirty-state tracking, Save/Reload state reset, and live theme
+  selection alongside the existing validated save path.
+- [x] T6 Added Ctrl+S, Escape, and F6 Settings bindings.
+- [ ] T7 Complete focus/accessibility labels and Settings filtering.
+
+
+### Invariants / acceptance
+
+1. Double-clicking playlist track N loads every track and starts at N.
+2. Next/previous traverse that same loaded queue.
+3. Player and Playlists show the same active track.
+4. Stop is hard; Pause/Resume keeps the position. Stop then Play/Continue
+   restores the same remembered position rather than silently jumping to zero.
+5. Volume uses the persistent −/+ buttons, Mute, and voice commands; the
+   song-position bar is independent, click/draggable from 0–100%, and never
+   fights the window drag handler.
+6. Slow yt-dlp/mpv work never executes on the Tk event thread or reads Tk
+   variables from a worker.
+7. `behaviour.ui: false` and every headless CLI mode remain unaffected.
+8. `player.playlist_path: null` hides the Playlists page.
+9. Full `unittest` suite and `git diff --check` pass before commit.
+
+### Manual Windows acceptance
+
+- Drag volume slowly/fast to 0/65/130; click track and use wheel/arrows.
+- Play a saved playlist, then use next/previous across its boundaries.
+- Switch pages while playing; active row and persistent transport stay correct.
+- Pause on one page, navigate, then Resume from the persistent control.
+- Stop, then Play: starts the selected queue track from the beginning.
+- Reorder a playlist while active; saved order and queue order agree.
+- Test 100%, 125%, and 150% Windows display scaling.
+
+---

@@ -9,6 +9,7 @@ any audio device or model is touched.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,7 @@ DEFAULTS: dict[str, Any] = {
         "extra_args": ["--no-video", "--really-quiet", "--idle=yes"],
         "playlist_path": None,
     },
-    "search": {"results": 5, "cookies_from_browser": None, "socket_timeout_s": 15},
+    "search": {"results": 10, "cookies_from_browser": None, "socket_timeout_s": 15},
     "behaviour": {
         "log_transcripts": True,
         "log_path": "./logs/transcripts.log",
@@ -92,23 +93,28 @@ DEFAULTS: dict[str, Any] = {
         "ui": True,
     },
     "commands": [
-        {"action": "play", "verbs": ["passa", "toca", "poe", "mete"], "takes_query": True},
+        {"action": "play", "verbs": ["play", "passa", "toca", "poe", "mete"], "takes_query": True},
+        {"action": "add", "verbs": ["add", "adiciona"], "takes_query": False},
+        {"action": "remove", "verbs": ["remove", "remover", "tira"], "takes_query": False},
+        {"action": "jump", "verbs": ["jump", "salta para"], "takes_query": True},
         {"action": "next", "verbs": ["proximo", "seguinte", "outra", "salta"], "takes_query": False},
         {"action": "prev", "verbs": ["previous", "anterior", "volta"], "takes_query": False},
-        {"action": "stop", "verbs": ["para", "pausa", "chega"], "takes_query": False},
+        {"action": "pause", "verbs": ["pause", "pausa"], "takes_query": False},
+        {"action": "stop", "verbs": ["stop", "para", "chega"], "takes_query": False},
         {"action": "resume", "verbs": ["continue", "continua", "retoma"], "takes_query": False},
         {"action": "volume_up", "verbs": ["mais alto", "aumenta", "sobe o som"], "takes_query": False},
         {"action": "volume_down", "verbs": ["mais baixo", "baixa", "baixa o som"], "takes_query": False},
     ],
     "ui": {
-        "overlay_width": 960,
-        "overlay_height": 540,
+        "overlay_width": 1100,
+        "overlay_height": 700,
         "always_on_top": True,
         "show_playlist": True,
         "fade_after_s": 30,
         "hide_after_s": 120,
         "hide_while_playing": False,
         "mode": "compact",
+        "theme": "midnight",
     },
 }
 
@@ -227,6 +233,7 @@ class UiConfig:
     hide_after_s: float
     hide_while_playing: bool
     mode: str
+    theme: str = "midnight"
 
 
 @dataclass(frozen=True)
@@ -579,6 +586,13 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         takes_query = item.get("takes_query", False)
         if not isinstance(takes_query, bool):
             raise ConfigError(f"{where}.takes_query must be true or false")
+        if takes_query and action not in ("play", "jump"):
+            # The matcher has one query slot: play and jump are the only actions
+            # that may consume a following numeric/search query.
+            raise ConfigError(
+                f"{where}.takes_query may only be true for action 'play' or 'jump' "
+                f"(got {action!r})"
+            )
         commands.append(
             CommandSpec(action=action, verbs=tuple(clean_verbs), takes_query=takes_query)
         )
@@ -601,6 +615,12 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
     mode = _str(ui_raw, "mode", "ui").lower()
     if mode not in ("compact", "expanded"):
         raise ConfigError(f"ui.mode must be one of 'compact', 'expanded' (got {mode!r})")
+    theme = _str(ui_raw, "theme", "ui").lower()
+    if theme not in ("midnight", "ocean", "ember", "mono", "rose"):
+        raise ConfigError(
+            "ui.theme must be one of 'midnight', 'ocean', 'ember', 'mono', 'rose' "
+            f"(got {theme!r})"
+        )
     ui_config = UiConfig(
         overlay_width=overlay_width,
         overlay_height=overlay_height,
@@ -610,6 +630,7 @@ def _build(raw: dict[str, Any], source: Path) -> Config:
         hide_after_s=hide_after_s,
         hide_while_playing=_bool(ui_raw, "hide_while_playing", "ui"),
         mode=mode,
+        theme=theme,
     )
 
     config = Config(
@@ -641,6 +662,27 @@ def _resolve_paths(config: Config) -> Config:
     return replace(config, player=player, asr=asr, vad=vad, behaviour=behaviour)
 
 
+def atomic_write_text(path: str | Path, text: str) -> None:
+    """Replace a UTF-8 text file without exposing a truncated version."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def save_config_sections(path: str | Path, sections: dict[str, Any]) -> None:
     """D3: merge *sections* (top-level keys) into the YAML file in place.
 
@@ -668,9 +710,9 @@ def save_config_sections(path: str | Path, sections: dict[str, Any]) -> None:
             loaded[name] = merged
         else:
             loaded[name] = values
-    path.write_text(
+    atomic_write_text(
+        path,
         yaml.safe_dump(loaded, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
     )
 
 

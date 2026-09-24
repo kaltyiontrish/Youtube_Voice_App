@@ -10,6 +10,8 @@ background thread while item 1 is already playing, which is what makes
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +49,8 @@ class ResolvedStream:
 class Searcher:
     """Thin yt-dlp facade used by the command handlers."""
 
+    _js_runtime_warning_logged = False
+
     def __init__(
         self,
         results: int = 5,
@@ -71,6 +75,19 @@ class Searcher:
             "extractor_retries": 2,
             "logger": _QuietLogger(),
         }
+        # yt-dlp 2025+ requires a JavaScript runtime for YouTube extraction.
+        # Deno is the supported default; configure it only when installed so
+        # the application still starts on machines without it.
+        deno = shutil.which("deno")
+        if deno:
+            options["js_runtimes"] = {"deno": {"path": deno}}
+        else:
+            if not Searcher._js_runtime_warning_logged:
+                LOGGER.warning(
+                    "yt-dlp JavaScript runtime not found: install Deno and yt-dlp-ejs; "
+                    "YouTube extraction may be incomplete"
+                )
+                Searcher._js_runtime_warning_logged = True
         if self.cookies_from_browser:
             options["cookiesfrombrowser"] = (self.cookies_from_browser,)
         options.update(extra)
@@ -85,7 +102,7 @@ class Searcher:
 
     # -- API ------------------------------------------------------------- #
 
-    def search(self, query: str) -> list[SearchResult]:
+    def search(self, query: str, music_only: bool = False) -> list[SearchResult]:
         """Return up to ``self.results`` hits for *query*, fastest possible."""
         query = (query or "").strip()
         if not query:
@@ -93,7 +110,15 @@ class Searcher:
         search_term = f"ytsearch{self.results}:{query}"
         LOGGER.debug("yt-dlp search: %s", search_term)
         try:
-            with yt_dlp.YoutubeDL(self._options(extract_flat="in_playlist")) as ydl:
+            options = {"extract_flat": "in_playlist"}
+            if music_only:
+                # Do not append YouTube's legacy `topicmusic` token here.  For
+                # artist names it can over-constrain ytsearch and return no
+                # results even when the artist has many uploads.  The browser
+                # list is already an explicit music action; the user's words
+                # should remain the search query.
+                search_term = f"ytsearch{self.results}:{query}"
+            with yt_dlp.YoutubeDL(self._options(**options)) as ydl:
                 info = ydl.extract_info(search_term, download=False)
         except yt_dlp.utils.DownloadError as exc:
             raise SearchError(f"search failed for {query!r}: {exc}. {self._hint()}") from exc
@@ -162,6 +187,11 @@ class _QuietLogger:
         LOGGER.debug("yt-dlp: %s", message)
 
     def warning(self, message: str) -> None:
+        if "No supported JavaScript runtime" in message:
+            if not Searcher._js_runtime_warning_logged:
+                LOGGER.warning(message)
+                Searcher._js_runtime_warning_logged = True
+            return
         LOGGER.warning("yt-dlp: %s", message)
 
     def error(self, message: str) -> None:

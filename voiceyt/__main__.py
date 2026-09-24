@@ -32,6 +32,7 @@ from .aec import diagnose as aec_diagnose
 from .commands import CommandRunner, validate_actions
 from .config import Config, ConfigError, load_config
 from .models import ALL, DownloadReport, download_targets, ensure_models, summary
+from .search import SearchError
 from .transcripts import PARTIAL, TranscriptLog, read_entries, replay
 
 LOGGER = logging.getLogger("voiceyt")
@@ -617,10 +618,51 @@ def _ui_switch_mic(listener, ui, index: int) -> None:
 
 
 def _ui_quit(listener) -> None:
-    """Tray quit: stop capture so ``listener.run()`` returns (shutdown flag
-    is already set by the tray)."""
-    LOGGER.info("quit from the tray")
+    """Stop the listener so the main process reaches its cleanup and returns."""
+    LOGGER.info("quit requested from UI")
     listener.stop()
+
+
+def _ui_browse_query(searcher, ui, query: str) -> None:
+    """Return music matches to the UI without changing playback."""
+    text = query.strip()
+    if not text:
+        return
+    try:
+        results = searcher.search(text, music_only=True)
+    except SearchError as exc:
+        LOGGER.warning("UI browse failed: %s", exc)
+        ui.set_error(f"search: {exc}")
+        return
+    ui.set_search_results([
+        {
+            "title": result.title,
+            "url": result.url,
+            "video_id": result.video_id,
+            "duration": result.duration,
+        }
+        for result in results
+    ], query=text)
+
+
+def _ui_play_playlist(runner, ui, tracks, start_index: int) -> None:
+    """Load an entire saved playlist through the same queue as voice search."""
+    from .search import SearchResult
+
+    clean = [track for track in tracks if track.get("url")]
+    if not 0 <= start_index < len(clean):
+        return
+    results = [
+        SearchResult(
+            video_id=str(track.get("url", "")).rsplit("=", 1)[-1],
+            title=str(track.get("title") or track.get("url") or "Unknown track"),
+            url=str(track["url"]),
+            duration=track.get("duration"),
+        )
+        for track in clean
+    ]
+    ui.set_action(f"play playlist from #{start_index + 1}")
+    runner.play_playlist(results, start_index)
 
 
 def _ui_play_query(runner, ui, query: str) -> None:
@@ -677,9 +719,14 @@ def run_daemon(config: Config) -> int:
     ui = None
     tray = None
     if config.behaviour.ui and config.ui_config:
-        ui = UiState(player=player)
+        ui = UiState(
+            player=player,
+            state_path=config.resolve("./logs/ui_state.json"),
+        )
+        saved_volume = ui.snapshot().get("volume", 50)
         try:
-            ui.set_volume(int(player.volume()))  # mpv may still be warming up
+            player.set_volume(int(saved_volume))
+            ui.set_volume(int(saved_volume))
         except Exception:
             pass
         ui.set_aec(f"AEC on ({config.aec.backend})" if config.aec.enabled else "")
@@ -693,7 +740,12 @@ def run_daemon(config: Config) -> int:
                 ui.set_action(f"{command.action} {command.query}".strip())
                 if command.action == "play" and command.query:
                     ui.note_query(command.query)  # E1: recent-history strip
-            runner.dispatch(command)
+            played = runner.dispatch(command)
+            if ui is not None and played and command.action == "play" and command.query:
+                ui.set_voice_previews(
+                    list(runner.last_results),
+                    [result.url for result in getattr(runner, "last_result_objects", ())],
+                )
 
     def on_utterance(text: str, ts: float) -> None:
         LOGGER.info("heard: %s", text)
@@ -736,6 +788,10 @@ def run_daemon(config: Config) -> int:
             on_quit=lambda: _ui_quit(listener),
             app_config=config,
             on_play_query=lambda query: _ui_play_query(runner, ui, query),
+            on_play_playlist=lambda tracks, index: _ui_play_playlist(
+                runner, ui, tracks, index
+            ),
+            on_browse_query=lambda query: _ui_browse_query(searcher, ui, query),
         )
 
     example_trigger = config.trigger.words[0]
@@ -758,6 +814,8 @@ def run_daemon(config: Config) -> int:
     finally:
         if tray is not None:
             tray.stop()
+        if ui is not None:
+            ui.overlay_done.wait(timeout=2.0)
         listener.stop()
         log.close()
         player.close()

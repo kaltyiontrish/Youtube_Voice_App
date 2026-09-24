@@ -17,9 +17,10 @@ from __future__ import annotations
 import io
 import json
 import logging
+import stat
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import numpy as np
 
@@ -30,6 +31,38 @@ LOGGER = logging.getLogger(__name__)
 
 MODEL_URL_TEMPLATE = "https://alphacephei.com/vosk/models/{name}.zip"
 SAMPLE_RATE = 16000
+MAX_MODEL_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_MODEL_FILES = 20_000
+
+
+def _safe_extract_model(archive: zipfile.ZipFile, destination: Path) -> None:
+    """Extract a model ZIP without traversal, links, or decompression bombs."""
+    destination = destination.resolve()
+    total = 0
+    members = archive.infolist()
+    if len(members) > MAX_MODEL_FILES:
+        raise ValueError(f"model archive contains too many files ({len(members)})")
+    for member in members:
+        path = PurePosixPath(member.filename.replace("\\", "/"))
+        mode = member.external_attr >> 16
+        windows_path = PureWindowsPath(member.filename)
+        if (
+            path.is_absolute()
+            or windows_path.is_absolute()
+            or windows_path.drive
+            or ".." in path.parts
+            or not path.parts
+        ):
+            raise ValueError(f"unsafe archive path {member.filename!r}")
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"archive links are not allowed: {member.filename!r}")
+        target = (destination / Path(*path.parts)).resolve()
+        if target != destination and destination not in target.parents:
+            raise ValueError(f"archive path escapes destination: {member.filename!r}")
+        total += member.file_size
+        if total > MAX_MODEL_ARCHIVE_BYTES:
+            raise ValueError("model archive expands beyond the 2 GiB safety limit")
+    archive.extractall(destination)
 
 
 class VoskBackend(BaseBackend):
@@ -83,7 +116,7 @@ class VoskBackend(BaseBackend):
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                archive.extractall(target.parent)
+                _safe_extract_model(archive, target.parent)
         except Exception as exc:
             raise AsrError(f"could not unpack {name}.zip: {exc}") from exc
         if not (target / "am" / "final.mdl").is_file():
